@@ -11,3 +11,5 @@ credentials*.json
 .terraform/
 *.tfvars
 *.tfplan
+greenops*.env
+run*.log
