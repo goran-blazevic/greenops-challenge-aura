@@ -8,3 +8,4 @@
 .env*
 greenops-exo*.json
 credentials*.json
+greenops*.env

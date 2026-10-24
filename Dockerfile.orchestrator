@@ -3,6 +3,11 @@ FROM ghcr.io/exogmi/greenops-challenge-starter-kit:latest
 COPY orchestrator /opt/greenops-starter/orchestrator
 WORKDIR /opt/greenops-starter
 ENV GREENOPS_STATE=/tmp/greenops-orch.json
-# Credentials arrive as EXOSCALE_API_KEY / EXOSCALE_API_SECRET / GREENOPS_CLOUD_ENDPOINT and
-# GREENOPS_GRID_ENDPOINT / GREENOPS_GRID_SECRET; nothing secret is baked in.
+# Credentials are never baked in (.dockerignore drops every env file). Supply them at
+# run time either as real variables - EXOSCALE_API_KEY / EXOSCALE_API_SECRET /
+# GREENOPS_CLOUD_ENDPOINT and GREENOPS_GRID_ENDPOINT / GREENOPS_GRID_SECRET - or, more
+# simply, by mounting this run's env file into the working directory, which is where the
+# orchestrator looks first:
+#   -v "$PWD/greenops.env:/opt/greenops-starter/greenops.env:ro"
+# GREENOPS_ENV_FILE names another path. `make docker-run` wires this up already.
 ENTRYPOINT ["python", "-m", "orchestrator.run", "run"]
