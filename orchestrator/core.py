@@ -119,6 +119,62 @@ def over_quota(m: Model, u: Usage) -> bool:
             or any(n > m.gpu_quota.get(f, 0) for f, n in u.cards.items()))
 
 
+FORECAST_H = 24      # hours of forecast this run publishes; the sample we rank on
+
+
+class Forecast:
+    """Per-area view of *this* run's currently published carbon intensity.
+
+    Besides the plain mean it answers "what intensity may a plan expect if it only
+    runs during the cleanest `duty` share of the published hours?".  That is the
+    intensity placement actually faces, because `decide_run` keeps the VM off during
+    the dirty ones.  Ranking on the flat mean undervalues a volatile grid and makes
+    every size of one GPU family look identical, which is what the footprint
+    tie-break then had to resolve blindly.
+    """
+
+    def __init__(self, means: dict | None = None):
+        self._mean: dict[str, float] = {k: float(v) for k, v in (means or {}).items()}
+        self._cum: dict[str, list[float]] = {}
+
+    def set(self, area: str, vals: list[float]) -> None:
+        window = [float(v) for v in vals[:FORECAST_H]]
+        if not window:
+            return
+        self._mean[area] = sum(window) / len(window)
+        cum, total = [0.0], 0.0
+        for v in sorted(window):
+            total += v
+            cum.append(total)
+        self._cum[area] = cum
+
+    def setdefault(self, area: str, value: float) -> None:
+        self._mean.setdefault(area, value)
+
+    def means(self) -> dict:
+        return self._mean
+
+    def mean(self, area: str) -> float:
+        return self._mean.get(area, 1.0)
+
+    def duty_mean(self, area: str, duty: float) -> float:
+        """Mean of the cleanest `duty` share of the published hours, interpolated over
+        the partial hour.  Falls back to the flat mean when no series is published."""
+        cum = self._cum.get(area)
+        if not cum:
+            return self.mean(area)
+        n = len(cum) - 1
+        x = min(max(duty, 1.0 / n), 1.0) * n
+        k = int(x)
+        rest = x - k
+        nxt = (cum[k + 1] - cum[k]) if k < n else 0.0   # the (k+1)-th cleanest hour
+        return (cum[k] + rest * nxt) / x
+
+
+def as_forecast(ci) -> Forecast:
+    return ci if isinstance(ci, Forecast) else Forecast(ci)
+
+
 @dataclass
 class Option:
     zone: str
@@ -128,8 +184,17 @@ class Option:
     footprint: float  # tie-break: smaller VMs leave quota for the others
 
 
-def rank_options(m: Model, w: dict, now: datetime, completed: float, ci_mean: dict,
-                 exclude=()) -> list[Option]:
+def rank_options(m: Model, w: dict, now: datetime, completed: float, ci,
+                 exclude=(), margin: float = 1.0, duty_aware: bool = True) -> list[Option]:
+    """Expected carbon of finishing `w` on each legal (zone, profile).
+
+    The compute phase is the only part that can be shifted, so it is priced at the
+    mean of the cleanest hours a plan with that duty cycle can occupy; boot, input
+    staging and output run whenever they fall and are priced at the flat mean.
+    A faster profile therefore earns its keep through a lower duty cycle, which is
+    the real reason to prefer it over a smaller one of the same efficiency.
+    """
+    f = as_forecast(ci)
     start = max(now, parse_ts(w["release_at"]))
     window_h = max((parse_ts(w["deadline_at"]) - start).total_seconds() / HOUR, 1e-6)
     remaining = max(float(w["required_work"]) - completed, 0.0)
@@ -137,13 +202,17 @@ def rank_options(m: Model, w: dict, now: datetime, completed: float, ci_mean: di
     out = []
     for slug, p in m.options(w, exclude):
         z = m.zones[slug]
+        area = z["electricity_area"]
         work_h = remaining / rate_per_hour(p)
         boot_h = float(p["boot_seconds"]) / HOUR
-        ratio = (work_h + over_h + boot_h) / window_h
-        ci = ci_mean.get(z["electricity_area"], 1.0)
+        idle_h = over_h + boot_h
+        ratio = (work_h + idle_h) / window_h
+        duty = min(1.0, work_h / max(window_h - idle_h, 1e-6) * margin)
+        ci_work = f.duty_mean(area, duty) if duty_aware else f.mean(area)
         # IT energy of the remaining work plus the idle boot/staging/output phases
-        kwh = (float(p["active_watts"]) * work_h + float(p["idle_watts"]) * (over_h + boot_h)) / 1000.0
-        cost = float(z["pue"]) * ci * kwh
+        kwh_work = float(p["active_watts"]) * work_h / 1000.0
+        kwh_idle = float(p["idle_watts"]) * idle_h / 1000.0
+        cost = float(z["pue"]) * (ci_work * kwh_work + f.mean(area) * kwh_idle)
         fp = p["cpu_cores"] + 1000 * p["gpu_count"]
         out.append(Option(slug, p["id"], ratio, cost, fp))
     return out
@@ -239,3 +308,26 @@ def workers_needed(remaining: float, hours_avail: float, p: dict, w: dict) -> in
         if eff_rate(p, n, s) * max(hours_avail, 0.0) >= remaining * 1.05:
             return n
     return int(w["max_workers"])
+
+
+def carbon_workers(w: dict, p: dict, remaining: float, hours_avail: float, ci,
+                   area: str, margin: float = 1.25, gain: float = 0.04) -> int:
+    """Worker count with the lowest expected carbon, not merely the one that fits.
+
+    `n` workers cost `1 + sync_overhead * (n - 1)` times the energy of one, but finish
+    in roughly `1/n` of the time and can therefore sit in the cleanest hours only.
+    Whenever the spread of the published forecast is wider than the sync penalty, more
+    workers are the cheaper plan; `gain` keeps us from paying for a marginal one.
+    """
+    f = as_forecast(ci)
+    s = float(w["sync_overhead"])
+    best_n, best_c = 1, None
+    for n in range(1, int(w["max_workers"]) + 1):
+        work_h = remaining / eff_rate(p, n, s)
+        duty = min(1.0, work_h / max(hours_avail, 1e-6) * margin)
+        c = (1.0 + s * (n - 1)) * f.duty_mean(area, duty)
+        if n == 1:
+            best_c = c
+        elif best_c is not None and c < best_c * (1.0 - gain):
+            best_n, best_c = n, c
+    return best_n

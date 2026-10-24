@@ -86,6 +86,41 @@ class PolicyTests(unittest.TestCase):
     def test_quantile(self):
         self.assertAlmostEqual(quantile([1, 2, 3, 4], 0.5), 2.5)
 
+    def test_duty_mean_prices_the_hours_a_plan_can_actually_pick(self):
+        from orchestrator.core import Forecast
+        f = Forecast()
+        f.set("AT", [100.0] * 6 + [500.0] * 18)
+        self.assertAlmostEqual(f.mean("AT"), 400.0)
+        self.assertAlmostEqual(f.duty_mean("AT", 0.25), 100.0)      # cleanest 6 of 24 h
+        self.assertAlmostEqual(f.duty_mean("AT", 1.0), 400.0)
+        self.assertAlmostEqual(f.duty_mean("AT", 0.0), 100.0)       # at least one hour
+        self.assertAlmostEqual(f.duty_mean("XX", 0.25), 1.0)        # no series -> flat default
+
+    def test_faster_profile_wins_on_a_volatile_grid(self):
+        from orchestrator.core import Forecast, parse_ts, pick, rank_options
+        m = model()
+        w = m.workloads["w-09-eu-large-model"]                      # one GPU family, sizes 1/2/4 cards
+        now = parse_ts("2025-10-01T07:00:00Z")
+        flat = {z["electricity_area"]: 300.0 for z in m.zones.values()}
+        # flat grid: all sizes cost the same per unit, so the footprint tie-break takes the
+        # smallest one that still fits inside the first feasibility tier
+        self.assertEqual(m.profiles[pick(rank_options(m, w, now, 0.0, flat)).pid]["gpu_count"], 2)
+        f = Forecast()
+        for z in m.zones.values():
+            f.set(z["electricity_area"], [100.0] * 6 + [500.0] * 18)
+        self.assertEqual(m.profiles[pick(rank_options(m, w, now, 0.0, f)).pid]["gpu_count"], 4)
+
+    def test_carbon_workers_pays_sync_overhead_only_for_a_real_cut(self):
+        from orchestrator.core import Forecast, carbon_workers
+        m = model()
+        w = m.workloads["w-14-bulk-render"]
+        p = m.profiles["20000000-0000-4000-8000-000000000003"]
+        spiky, flat = Forecast(), Forecast()
+        spiky.set("IT", [100.0] * 6 + [500.0] * 18)
+        flat.set("IT", [300.0] * 24)
+        self.assertGreater(carbon_workers(w, p, 1520.0, 80.0, spiky, "IT"), 1)
+        self.assertEqual(carbon_workers(w, p, 1520.0, 80.0, flat, "IT"), 1)
+
 
 class EndToEnd(unittest.TestCase):
     def test_all_workloads_meet_deadlines_and_vms_are_deleted(self):

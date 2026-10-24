@@ -5,7 +5,16 @@ work status and its currently published electricity forecast):
 
 * Placement  - for every workload pick the legal (zone, profile) with the
   lowest expected carbon for the remaining work, preferring plans that leave
-  slack for pausing and small footprints (shared vCPU/GPU quota).
+  slack for pausing and small footprints (shared vCPU/GPU quota).  Expected
+  carbon prices the compute phase at the cleanest hours a plan of that duty
+  cycle can occupy, so a volatile grid and a faster VM are both valued for what
+  they really buy: the freedom to skip the dirty hours.
+* Sizing     - where a workload may run several workers, workers are added while
+  the sync-overhead energy penalty stays below the intensity cut a shorter run
+  wins, not only when a deadline is at risk.
+* Staging    - boot and input staging draw idle power but consume wall clock, so
+  they start one staging length before the next clean stretch and are never
+  paused: clean hours belong to the compute phase.
 * Timing     - a VM only runs during the cleanest hours of the next day.  The
   run-share q is derived from the slack to the deadline; stopped VMs draw no
   power but keep their quota.  Jobs with little slack run continuously, and are
@@ -27,8 +36,9 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from .core import (HOUR, Illegal, Model, Usage, decide_run, dirty_run_h, eff_rate, excess, over_quota,
-                   min_footprint, parse_ts, pick, rank_options, rate_per_hour, workers_needed)
+from .core import (HOUR, Forecast, Illegal, Model, Usage, carbon_workers, decide_run, dirty_run_h,
+                   eff_rate, excess, over_quota, min_footprint, parse_ts, pick, rank_options,
+                   rate_per_hour, workers_needed)
 
 END_STATES = {"COMPLETED", "INVALIDATED", "UNAVAILABLE"}
 PRESSURE_H = 8.0       # only workloads releasing within this many hours create quota pressure
@@ -42,14 +52,19 @@ PARK_INPUT_S = 900     # ... and at most 15 min of input staging per new VM
 PARK_LAX_H = 12.0      # never park a job with less than this slack
 PARK_MIN_H = 4         # park only if the forecast says the job would wait at least this long
 PARK_COOLDOWN_H = 2.0  # a (re)started VM runs at least this long before it may be parked
+SCALE_GAIN = 0.04      # extra workers must cut expected intensity by this much to be worth the sync cost
+STAGE_MIN_H = 0.5      # only pre-stage jobs whose boot+input is at least this long
 NAME = re.compile(r"^orch-(?P<wid>w-[a-z0-9-]+?)-(?P<n>\d+)-p(?P<pid>\d+)$")
 
 
 class Controller:
     def __init__(self, env, model: Model, *, carbon_aware=True, margin=MARGIN, park=True,
+                 duty=True, scale=True, prestage=True, reserve_best=True,
                  exclude=(), state_path=None, log=print):
         self.env, self.m = env, model
         self.carbon_aware, self.margin, self.park = carbon_aware, margin, park
+        self.duty, self.scale, self.prestage = duty, scale, prestage
+        self.reserve_best = reserve_best
         self.exclude, self.log = set(exclude), log
         self.state_path = Path(state_path) if state_path else None
         self.vms: dict[str, list[dict]] = {}
@@ -58,7 +73,7 @@ class Controller:
         self.done: set[str] = set()
         self.last_change: dict = {}
         self.series: dict[str, list[float]] = {}
-        self.ci_mean: dict[str, float] = {}
+        self.ci = Forecast()
         self._grid_hour = None
         self.pressure = self.crunch = False
         self._load()
@@ -119,11 +134,12 @@ class Controller:
             vals = [ci for dt, ci in f if dt >= hour]
             if vals:
                 self.series[area] = vals
-                self.ci_mean[area] = sum(vals[:24]) / len(vals[:24])
-        if self.ci_mean:
-            avg = sum(self.ci_mean.values()) / len(self.ci_mean)
+                self.ci.set(area, vals)
+        known = self.ci.means()
+        if known:
+            avg = sum(known.values()) / len(known)
             for z in self.m.zones.values():
-                self.ci_mean.setdefault(z["electricity_area"], avg)
+                self.ci.setdefault(z["electricity_area"], avg)
 
     # ----------------------------------------------------------- clock start
     def _start_clock(self):
@@ -178,6 +194,10 @@ class Controller:
         return "done" if len(self.done) == len(self.m.workloads) else "wait"
 
     # ------------------------------------------------------------ assessment
+    def _rank(self, w, now, completed):
+        return rank_options(self.m, w, now, completed, self.ci, self.exclude,
+                            self.margin, self.duty and self.carbon_aware)
+
     def _assess(self, w, s, now):
         completed, required = float(s["completed_work"]), float(w["required_work"])
         vms = self.vms.get(w["id"], [])
@@ -190,7 +210,7 @@ class Controller:
             rate = eff_rate(p, len(vms), float(w["sync_overhead"]))
             zone = vms[0]["zone"]
         else:
-            opts = rank_options(self.m, w, now, completed, self.ci_mean, self.exclude)
+            opts = self._rank(w, now, completed)
             plan = pick(opts)
             if plan is None:
                 return {"laxity": -1e9, "plan": None, "completed": completed}
@@ -239,9 +259,12 @@ class Controller:
         if self.pressure and not run and not parked:   # a parked job waits for its own clean hours
             run = not (vms and not self.crunch and self._pause_value(a, series) > PAUSE_VALUE)
         if not vms:
-            if run:
+            if run or self._stage_early(w, a, series):
                 self._create(w, now)
             return
+        if a["completed"] <= 0.0 and self.prestage and self.carbon_aware:
+            run = True                          # boot+staging draw idle power only: get them
+            forced = True                       # out of the way instead of spending clean hours on them
         if forced:
             self._scale_out(w, a, now)
         else:
@@ -254,7 +277,43 @@ class Controller:
                     and dirty_run_h(a["rem_h"], a["to_dl"], a["out_h"], series, self.margin) >= PARK_MIN_H):
                 self._park(wid, now, assign)
                 return
+        if run and self.scale and self.carbon_aware and not self.pressure and self.vms.get(wid):
+            self._scale_carbon(w, a, now)
         self._power(wid, run, now, assign, force=forced)
+
+    def _stage_early(self, w, a, series) -> bool:
+        """Create the VM one staging length before the next clean stretch.
+
+        Boot and input staging draw only idle watts but consume wall clock, so letting
+        them eat the first clean hours pushes the compute phase into dirtier ones.
+        Held off while quota is short, where an early VM would block someone else."""
+        if not (self.prestage and self.carbon_aware) or self.pressure or a["completed"] > 0:
+            return False
+        lead = (float(a["p"]["boot_seconds"]) + float(w["input_seconds"])) / HOUR
+        if lead < STAGE_MIN_H:
+            return False
+        wait = dirty_run_h(a["rem_h"], a["to_dl"], a["out_h"], series, self.margin)
+        return 0 < wait <= lead
+
+    def _scale_carbon(self, w, a, now):
+        """Add workers while the extra sync energy buys a bigger cut in intensity.
+
+        Unlike `_scale_out`, which rescues a deadline, this spends energy to shrink the
+        duty cycle: fewer hours of work means only the cleanest hours are used."""
+        wid = w["id"]
+        vms = self.vms[wid]
+        if len(vms) >= int(w["max_workers"]) or int(w["max_workers"]) <= 1:
+            return
+        area = self.m.zones[a["zone"]]["electricity_area"]
+        remaining = float(w["required_work"]) - a["completed"]
+        avail = a["to_dl"] - a["out_h"] - (w["input_seconds"] + 120) / HOUR
+        want = carbon_workers(w, a["p"], remaining, avail, self.ci, area, self.margin, SCALE_GAIN)
+        if want <= len(vms):
+            return
+        usage = self._with_reservations(wid, now)
+        while len(self.vms[wid]) < want and usage.fits(self.m, a["p"]):
+            self._spawn(w, vms[0]["zone"], vms[0]["pid"])
+            usage.add(a["p"])
 
     def _pause_value(self, a, series) -> float:
         """Carbon a pause saves per hour and per vCPU of quota the paused VM keeps blocked
@@ -284,7 +343,7 @@ class Controller:
     def _create(self, w, now):
         wid = w["id"]
         usage = self._with_reservations(wid, now)
-        opts = rank_options(self.m, w, now, self._plans[wid]["completed"], self.ci_mean, self.exclude)
+        opts = self._rank(w, now, self._plans[wid]["completed"])
         o = pick(opts, self.m, usage)
         if o is None:
             return                              # wait for quota
@@ -308,13 +367,21 @@ class Controller:
                 continue
             if (parse_ts(wo["release_at"]) - now).total_seconds() >= RESERVE_H * HOUR:
                 continue
-            opts = rank_options(self.m, wo, now, a["completed"], self.ci_mean, self.exclude)
+            opts = self._rank(wo, now, a["completed"])
             tight = int(wo["max_workers"]) == 1 and min(o.ratio for o in opts) > 0.4
             if a["laxity"] < mine or tight:
-                o = min_footprint(opts)
+                o = pick(opts) if self._no_fallback(wo, opts) else min_footprint(opts)
                 if o:
                     usage.add(self.m.profiles[o.pid])
         return usage
+
+    def _no_fallback(self, w, opts) -> bool:
+        """Every legal option of this workload draws on one GPU family, so nothing else
+        can carry it if we take those cards.  Reserve the plan it actually wants rather
+        than the bare minimum: GPU jobs are the energy-dense ones and lose the most when
+        they are pushed onto a single card and have to run through the dirty hours."""
+        return (self.reserve_best and w["kind"] == "gpu"
+                and len({self.m.profiles[o.pid]["family"] for o in opts}) == 1)
 
     def _spawn(self, w, zone, pid):
         self.m.assert_legal(w, zone, pid)       # hard stop before any API call
