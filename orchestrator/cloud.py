@@ -123,3 +123,25 @@ class CloudEnv:
             return [(parse_ts(p["datetime"]), float(p["carbonIntensity"])) for p in r.json()["forecast"]]
         except (requests.RequestException, KeyError, ValueError):
             return None
+
+
+    def histories(self, areas):
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            return dict(zip(areas, ex.map(self.history, areas)))
+
+    def history(self, area):
+        """Already-published hourly observations from this run only."""
+        if not self.grid:
+            return []
+        try:
+            r=requests.get(self.grid+"/carbon-intensity/history",
+                params={"zone":area,"temporalGranularity":"hourly"},
+                headers={"auth-token":self.grid_secret},timeout=20,allow_redirects=False)
+            if r.status_code in {404,422}:
+                return []
+            r.raise_for_status(); body=r.json()
+            if body.get("zone") != area:
+                return []
+            return [(parse_ts(x["datetime"]),float(x["carbonIntensity"])) for x in body.get("history",[])]
+        except (requests.RequestException,KeyError,TypeError,ValueError):
+            return []

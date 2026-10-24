@@ -87,6 +87,42 @@ class PolicyTests(unittest.TestCase):
         self.assertAlmostEqual(quantile([1, 2, 3, 4], 0.5), 2.5)
 
 
+
+    def test_gpu_reservation_prefers_shorter_profile_for_clean_window(self):
+        from orchestrator.core import parse_ts, rank_options
+        m = model()
+        w = m.workloads["w-09-eu-large-model"]
+        opts = rank_options(m, w, parse_ts("2025-10-01T07:00:00Z"), 0.0, {})
+        clean_window = [o for o in opts if o.ratio <= 0.40]
+        self.assertTrue(clean_window)
+        # A one-card small VM is not a valid reservation for this 46h workload.
+        self.assertTrue(all(m.profiles[o.pid]["size"] != "small" for o in clean_window))
+
+
+    def test_long_gpu_waits_for_a_clean_window_profile_when_quota_tight(self):
+        from orchestrator.core import parse_ts
+        m=model(); env=FakeEnv(m,WORKLOADS,1); ctl=Controller(env,m,log=lambda *_:None)
+        wid="w-07-eu-training"; w=m.workloads[wid]
+        # Deliberately occupy quota so only the small profile could fit.
+        usage=Usage(); usage.vms=19; usage.vcpus=280
+        for family,n in (("gpurtx6000pro",2),): usage.cards[family]=n
+        ctl._todo=[wid]; ctl._plans={wid:{"completed":0.0,"laxity":60.0}}
+        ctl.usage=lambda: usage
+        ctl._with_reservations=lambda wid,now: usage
+        before=len(env.vms)
+        ctl._create(w, parse_ts("2025-09-30T13:00:00Z"))
+        self.assertEqual(len(env.vms),before)
+
+    def test_long_gpu_uses_clean_window_profile_when_quota_available(self):
+        from orchestrator.core import parse_ts
+        m=model(); env=FakeEnv(m,WORKLOADS,1); ctl=Controller(env,m,log=lambda *_:None)
+        wid="w-09-eu-large-model"; w=m.workloads[wid]
+        ctl._todo=[wid]; ctl._plans={wid:{"completed":0.0,"laxity":60.0}}
+        ctl._with_reservations=lambda wid,now: Usage()
+        ctl._create(w, parse_ts("2025-10-01T07:00:00Z"))
+        vm=next(iter(env.vms.values()))
+        self.assertEqual(m.profiles[vm["pid"]]["size"], "medium")
+
 class EndToEnd(unittest.TestCase):
     def test_all_workloads_meet_deadlines_and_vms_are_deleted(self):
         for seed in (1, 2, 3):
@@ -108,6 +144,20 @@ class PauseValueAndParking(unittest.TestCase):
         self.assertEqual(excess(10, 90, 1, clean), 0.0)              # clean hour: nothing to gain
         self.assertGreater(excess(10, 90, 1, [300.0] + clean), 1.0)  # far above the run threshold
         self.assertEqual(dirty_run_h(10, 90, 1, [300.0] * 5 + clean), 5)
+
+
+    def test_only_short_checkpoint_jobs_are_eligible_for_parking(self):
+        m=model()
+        ctl=Controller(FakeEnv(m,WORKLOADS,1),m,log=lambda *_:None)
+        # w-04 and w-14 checkpoint at 15 min; w-05 and w-13 need 30 min.
+        for wid in ("w-04-dach-batch", "w-14-bulk-render"):
+            w=m.workloads[wid]
+            a={"laxity":24.0}
+            self.assertTrue(ctl._portable(w,a))
+        for wid in ("w-05-eu-render", "w-13-regional-index"):
+            w=m.workloads[wid]
+            a={"laxity":24.0}
+            self.assertFalse(ctl._portable(w,a))
 
     def test_only_cheap_to_restart_jobs_are_parked_and_restarts_stay_legal(self):
         for seed in (1, 2):

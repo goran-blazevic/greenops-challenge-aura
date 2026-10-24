@@ -103,6 +103,19 @@ class BenchEnv(FakeEnv):
             return FakeEnv.forecast(self, area)
         return self.grid.forecast(area, self.t)
 
+    def histories(self, areas):
+        # Return only synthetic observations whose hourly interval ended at least
+        # one virtual hour ago, mirroring the challenge publication delay.
+        now = self.t.replace(minute=0, second=0, microsecond=0)
+        out = {}
+        for area in areas:
+            rows = []
+            for age in range(24, 0, -1):
+                valid = now - timedelta(hours=age)
+                rows.append((valid, self.actual(area, valid)))
+            out[area] = rows
+        return out
+
     def _burn(self, v, mode, dt):
         if STAGE_ACTIVE and mode == "idle" and v.get("stage", 0) > 0 and v["state"] == "running":
             mode = "active"

@@ -20,6 +20,7 @@ from pathlib import Path
 
 from .controller import MARGIN, Controller, run_loop
 from .core import Model, parse_ts, pick, rank_options
+from .memory import RunMemory
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -46,6 +47,7 @@ def main(argv=None):
     ap.add_argument("action", choices=["plan", "run", "cleanup"])
     ap.add_argument("--config", default=os.environ.get("GREENOPS_CONFIG", "greenops-exo.json"))
     ap.add_argument("--state", type=Path, help="receipt file (default /tmp/greenops-orch-<run>.json)")
+    ap.add_argument("--memory-db", type=Path, help="SQLite learning DB for this run only; default .local/greenops-memory-<run-hash>.sqlite3")
     ap.add_argument("--margin", type=float, default=MARGIN, help="pause aggressiveness: higher = pause less")
     ap.add_argument("--no-park", action="store_true",
                     help="never delete-and-restart checkpointed jobs during dirty hours (stop them instead)")
@@ -62,19 +64,25 @@ def main(argv=None):
     account = static.read_account(args.config)
     run_hash = hashlib.sha256(account["endpoint"].encode()).hexdigest()[:10]
     state = args.state or Path(os.environ.get("GREENOPS_STATE", f"/tmp/greenops-orch-{run_hash}.json"))
+    memory_path = args.memory_db or Path(os.environ.get("GREENOPS_MEMORY_DB", str(ROOT / ".local" / f"greenops-memory-{run_hash}.sqlite3")))
+    memory = RunMemory(memory_path, account["endpoint"])
     env = CloudEnv(account, os.environ.get("GREENOPS_GRID_ENDPOINT"), os.environ.get("GREENOPS_GRID_SECRET"))
     if not env.grid and not args.no_carbon:
         print("warning: no grid credentials -> running without carbon awareness", file=sys.stderr)
     env.warm()
     ctl = Controller(env, m, carbon_aware=bool(env.grid) and not args.no_carbon, margin=args.margin,
                      park=not args.no_park,
-                     exclude=args.avoid_zones, state_path=state,
+                     exclude=args.avoid_zones, state_path=state, memory=memory,
                      log=lambda s: print(datetime.now(timezone.utc).strftime("%H:%M:%S"), s, flush=True))
     if args.action == "cleanup":
-        ctl.adopt()
-        ctl.cleanup_all()
-        return
-    run_loop(ctl, log=print)
+        ctl.adopt(); ctl.cleanup_all()
+        print(f"same-run SQLite records: {memory.stats()}")
+        memory.close(); return
+    try:
+        run_loop(ctl, log=print)
+    finally:
+        print(f"same-run SQLite records: {memory.stats()}")
+        memory.close()
 
 
 if __name__ == "__main__":

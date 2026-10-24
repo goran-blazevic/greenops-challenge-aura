@@ -140,7 +140,23 @@ def rank_options(m: Model, w: dict, now: datetime, completed: float, ci_mean: di
         work_h = remaining / rate_per_hour(p)
         boot_h = float(p["boot_seconds"]) / HOUR
         ratio = (work_h + over_h + boot_h) / window_h
-        ci = ci_mean.get(z["electricity_area"], 1.0)
+        ci_data = ci_mean.get(z["electricity_area"], 1.0)
+        # A 24h forecast must not be extrapolated across a 40-90h workload.
+        # For the post-horizon tail, blend only this run's already-published
+        # historical mean, shrinking it toward the current forecast when history
+        # is sparse. This is a horizon-aware expected-intensity estimate, not a
+        # stored cross-run scenario profile.
+        total_h = max(work_h + over_h + boot_h, 1e-9)
+        if isinstance(ci_data, dict):
+            forecast_ci = float(ci_data.get("forecast_mean", 1.0))
+            history_ci = float(ci_data.get("history_mean", forecast_ci))
+            hist_n = int(ci_data.get("history_count", 0))
+            confidence = min(1.0, hist_n / 12.0)
+            tail_ci = history_ci * confidence + forecast_ci * (1.0 - confidence)
+            forecast_h = min(total_h, 24.0)
+            ci = (forecast_ci * forecast_h + tail_ci * (total_h - forecast_h)) / total_h
+        else:
+            ci = float(ci_data)
         # IT energy of the remaining work plus the idle boot/staging/output phases
         kwh = (float(p["active_watts"]) * work_h + float(p["idle_watts"]) * (over_h + boot_h)) / 1000.0
         cost = float(z["pue"]) * ci * kwh

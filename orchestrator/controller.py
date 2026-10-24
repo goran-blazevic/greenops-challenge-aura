@@ -24,7 +24,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .core import (HOUR, Illegal, Model, Usage, decide_run, dirty_run_h, eff_rate, excess, over_quota,
@@ -37,28 +37,29 @@ DWELL_H = 0.4          # minimum virtual hours between start/stop toggles (stop/
 MARGIN = 1.25          # run-share safety factor: q = needed time / time left x MARGIN
 PAUSE_VALUE = 0.1      # g CO2e per hour and per held vCPU a pause must save while quota is short
 CRUNCH_H = 20.0        # a waiting job with less slack than this blocks all voluntary pauses
-PARK_CKPT_S = 1800     # "portable" jobs: checkpoint at least every 30 min ...
-PARK_INPUT_S = 900     # ... and at most 15 min of input staging per new VM
-PARK_LAX_H = 12.0      # never park a job with less than this slack
-PARK_MIN_H = 4         # park only if the forecast says the job would wait at least this long
-PARK_COOLDOWN_H = 2.0  # a (re)started VM runs at least this long before it may be parked
+PARK_CKPT_S = 900      # only short-checkpoint jobs are restartable enough
+PARK_INPUT_S = 300     # keep restart staging below five minutes
+PARK_LAX_H = 16.0      # require ample deadline slack before parking
+PARK_MIN_H = 8         # park only for genuinely long dirty stretches
+PARK_COOLDOWN_H = 6.0  # prevent repeated delete/re-stage cycles
 NAME = re.compile(r"^orch-(?P<wid>w-[a-z0-9-]+?)-(?P<n>\d+)-p(?P<pid>\d+)$")
 
 
 class Controller:
     def __init__(self, env, model: Model, *, carbon_aware=True, margin=MARGIN, park=True,
-                 exclude=(), state_path=None, log=print):
+                 exclude=(), state_path=None, memory=None, log=print):
         self.env, self.m = env, model
         self.carbon_aware, self.margin, self.park = carbon_aware, margin, park
         self.exclude, self.log = set(exclude), log
         self.state_path = Path(state_path) if state_path else None
+        self.memory = memory
         self.vms: dict[str, list[dict]] = {}
         self.gen: dict[str, int] = {}          # next VM number per workload (names stay unique after parking)
         self.starter: dict | None = None
         self.done: set[str] = set()
         self.last_change: dict = {}
         self.series: dict[str, list[float]] = {}
-        self.ci_mean: dict[str, float] = {}
+        self.ci_mean: dict[str, object] = {}
         self._grid_hour = None
         self.pressure = self.crunch = False
         self._load()
@@ -112,18 +113,31 @@ class Controller:
         areas = sorted({z["electricity_area"] for z in self.m.zones.values()})
         batch = getattr(self.env, "forecasts", None)
         fs = batch(areas) if batch else {a: self.env.forecast(a) for a in areas}
+        histories = self.env.histories(areas) if hasattr(self.env, "histories") else {}
         for area in areas:
             f = fs.get(area)
             if f is None:
                 continue
+            raw = list(f)
+            if self.memory:
+                self.memory.record_forecast(area, now, raw)
+                self.memory.record_history(area, now, histories.get(area, []))
+                f = self.memory.calibrate(area, now, raw)
             vals = [ci for dt, ci in f if dt >= hour]
             if vals:
                 self.series[area] = vals
-                self.ci_mean[area] = sum(vals[:24]) / len(vals[:24])
+                forecast_mean = sum(vals[:24]) / len(vals[:24])
+                published_history = [(dt, ci) for dt, ci in histories.get(area, []) if dt < now]
+                hist_values = [float(ci) for _, ci in published_history[-24:]]
+                history_mean = sum(hist_values) / len(hist_values) if hist_values else forecast_mean
+                self.ci_mean[area] = {"forecast_mean": forecast_mean,
+                                      "history_mean": history_mean,
+                                      "history_count": len(hist_values)}
         if self.ci_mean:
-            avg = sum(self.ci_mean.values()) / len(self.ci_mean)
+            avg = sum(float(v.get("forecast_mean", 1.0)) if isinstance(v, dict) else float(v)
+                      for v in self.ci_mean.values()) / len(self.ci_mean)
             for z in self.m.zones.values():
-                self.ci_mean.setdefault(z["electricity_area"], avg)
+                self.ci_mean.setdefault(z["electricity_area"], {"forecast_mean": avg, "history_mean": avg, "history_count": 0})
 
     # ----------------------------------------------------------- clock start
     def _start_clock(self):
@@ -144,6 +158,8 @@ class Controller:
         st = self.env.status()
         if st is None:
             return "wait"
+        if self.memory:
+            self.memory.record_status(st)
         if st["qualification"] == "DISQUALIFIED":
             raise RuntimeError("run is disqualified - stopping")
         if st["state"] in END_STATES:
@@ -158,6 +174,7 @@ class Controller:
         if st["state"] == "PAUSED":
             return "wait"
         now = parse_ts(st["virtual_time"])
+        self._virtual_now = now
         if self.starter:
             self.env.delete(self.starter["zone"], self.starter["id"])
             self.starter = None
@@ -276,6 +293,8 @@ class Controller:
 
     def _park(self, wid, now, assign):
         if self._delete_workload(wid, why="parked"):
+            if self.memory:
+                self.memory.event(now, "park", wid)
             self.log(f"{wid}: parked at {now:%d %H:%M} virtual")
         else:
             self._power(wid, False, now, assign)          # could not delete: at least stop it
@@ -288,6 +307,18 @@ class Controller:
         o = pick(opts, self.m, usage)
         if o is None:
             return                              # wait for quota
+        if w["kind"] == "gpu":
+            # Long GPU work benefits from a short enough worker profile to use
+            # clean forecast windows. Do not consume quota with a one-card plan
+            # whose runtime exceeds 40% of its deadline window when a clean-window
+            # profile exists but is temporarily blocked by other allocations.
+            short = [candidate for candidate in opts if candidate.ratio <= 0.40]
+            target = pick(short) if short else None
+            if target and o.ratio > 0.40:
+                target_profile = self.m.profiles[target.pid]
+                if not usage.fits(self.m, target_profile):
+                    return  # hold for the efficient GPU plan; deadline slack remains reserved
+                o = target
         if self._plans[wid]["completed"] > 0 and self._portable(w, self._plans[wid]):
             # a parked job has slack: wait for room for its efficient VM instead of a worse fallback
             best = pick(opts)
@@ -311,7 +342,15 @@ class Controller:
             opts = rank_options(self.m, wo, now, a["completed"], self.ci_mean, self.exclude)
             tight = int(wo["max_workers"]) == 1 and min(o.ratio for o in opts) > 0.4
             if a["laxity"] < mine or tight:
-                o = min_footprint(opts)
+                # Reserve a clean-hour-capable GPU profile for released/near-release
+                # GPU work. A tiny profile can fit quota but force 35-46h of dirty
+                # runtime; medium profiles for w-07/w-09 materially improve timing
+                # flexibility and are often energy-neutral per unit of work.
+                if wo["kind"] == "gpu":
+                    clean_window = [o for o in opts if o.ratio <= 0.40]
+                    o = min(clean_window, key=lambda x: (x.cost, x.footprint)) if clean_window else min_footprint(opts)
+                else:
+                    o = min_footprint(opts)
                 if o:
                     usage.add(self.m.profiles[o.pid])
         return usage
@@ -325,6 +364,8 @@ class Controller:
         vid = self.env.create(zone, p, w["id"], name)
         self.vms.setdefault(w["id"], []).append({"id": vid, "zone": zone, "pid": pid, "name": name, "run": True})
         self._save()
+        if self.memory:
+            self.memory.event(self._virtual_now or datetime.now(timezone.utc), "create", w["id"], zone=zone, profile=pid, name=name)
         self.log(f"{w['id']}: +VM {name} in {zone}")
 
     def _scale_out(self, w, a, now):
@@ -354,6 +395,8 @@ class Controller:
             v["run"] = run
         if changed:
             self.last_change[wid] = now
+            if self.memory:
+                self.memory.event(now, "resume" if run else "pause", wid)
             self._save()
             self.log(f"{wid}: {'resume' if run else 'pause'} at {now:%d %H:%M} virtual")
 

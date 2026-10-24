@@ -4,7 +4,7 @@ Controls all 15 workloads of the GreenOps challenge.  Code: `core.py` (pure deci
 `controller.py` (loop, quota handling, VM lifecycle), `cloud.py` (Exoscale binding + grid API),
 `run.py` (CLI).  Tests: `tests/test_orchestrator.py` with an offline stand-in simulator
 (`tests/fake_env.py`, synthetic electricity - never real or run data).
-Policy benchmark: `python tests/bench.py` (many random synthetic grids, see below).
+Policy benchmark: `python tests/bench.py` (many random synthetic grids, see below). Rechecked in this workspace on 48 paired seeds.
 
 ## Run (inside the starter container, fresh run credentials in `greenops-exo.json`)
 
@@ -48,17 +48,15 @@ Only this run's published forecast is used; nothing is cached across runs or emb
 
 ## Offline benchmark (synthetic grids only)
 
-`tests/bench.py` replays the controller against many randomly generated electricity curves
-(levels, daily cycles, multi-day swings, noise, forecast error) and the documented accounting:
-idle watts for boot/staging/output, active watts for compute, nothing while stopped, lifecycle
-kg/h for every non-stopped hour, uncheckpointed work lost on delete. Result vs. the previous
-version (48 seeds each, no deadline missed in any run):
+`tests/bench.py` uses invented grids and the simulator's public accounting model. Latest paired 24-seed check after horizon-aware scoring, selective parking and GPU quota reservations:
 
-| synthetic grid family            | usage CO2 v1 | usage CO2 v2 | change |
-|----------------------------------|-------------:|-------------:|-------:|
-| daily cycle (`fake_env.py`)      | 15.26 kg     | 13.81 kg     | -9.5 % |
-| random levels/cycles/weather     | 10.61 kg     | 10.12 kg     | -4.4 % |
+| artificial grid | mean electricity | mean lifecycle | mean total | maximum total | missed / leftover VMs |
+|---|---:|---:|---:|---:|---:|
+| random levels/cycles/weather | 9.62 kg | 9.38 kg | 19.00 kg | 27.67 kg | 0 / 0 |
+| daily-cycle test grid | 13.55 kg | 9.40 kg | 22.96 kg | 24.59 kg | 0 / 0 |
 
-Lifecycle (not scored) rises by ~1 % because parked jobs boot and stage again.
-These numbers come from invented grids and only show the direction of the change; the real
-result depends on the run's electricity.
+The benchmark does **not** guarantee the live run will be below 20 kg. The worst synthetic cases exceed that target.
+
+## Run-local learning database
+
+The CLI creates `.local/greenops-memory-<run-hash>.sqlite3` by default; `--memory-db` overrides the location. It persists forecast points fetched from that run, published history, workload status, actions and horizon-bucket forecast residuals. It learns calibration only after the run publishes the corresponding observation. The SQLite metadata binds the DB to the exact cloud endpoint hash; using it with another run is rejected. No secret is written to SQLite. Do not transfer the DB or its forecasts between runs.
