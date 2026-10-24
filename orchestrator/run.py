@@ -18,7 +18,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .controller import Controller, run_loop
+from .controller import MARGIN, Controller, run_loop
 from .core import Model, parse_ts, pick, rank_options
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -46,7 +46,9 @@ def main(argv=None):
     ap.add_argument("action", choices=["plan", "run", "cleanup"])
     ap.add_argument("--config", default=os.environ.get("GREENOPS_CONFIG", "greenops-exo.json"))
     ap.add_argument("--state", type=Path, help="receipt file (default /tmp/greenops-orch-<run>.json)")
-    ap.add_argument("--margin", type=float, default=1.4, help="pause aggressiveness: higher = pause less")
+    ap.add_argument("--margin", type=float, default=MARGIN, help="pause aggressiveness: higher = pause less")
+    ap.add_argument("--no-park", action="store_true",
+                    help="never delete-and-restart checkpointed jobs during dirty hours (stop them instead)")
     ap.add_argument("--no-carbon", action="store_true", help="baseline: never pause, ignore forecasts")
     ap.add_argument("--avoid-zones", nargs="*", default=[], help="zone slugs never to use, e.g. fr-par-1")
     args = ap.parse_args(argv)
@@ -65,6 +67,7 @@ def main(argv=None):
         print("warning: no grid credentials -> running without carbon awareness", file=sys.stderr)
     env.warm()
     ctl = Controller(env, m, carbon_aware=bool(env.grid) and not args.no_carbon, margin=args.margin,
+                     park=not args.no_park,
                      exclude=args.avoid_zones, state_path=state,
                      log=lambda s: print(datetime.now(timezone.utc).strftime("%H:%M:%S"), s, flush=True))
     if args.action == "cleanup":

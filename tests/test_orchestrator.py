@@ -9,7 +9,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 from fake_env import FakeEnv                      # noqa: E402
 from orchestrator.controller import Controller    # noqa: E402
-from orchestrator.core import Illegal, Model, Usage, decide_run, quantile  # noqa: E402
+from orchestrator.core import Illegal, Model, Usage, decide_run, dirty_run_h, excess, quantile  # noqa: E402
 
 CATALOG = json.loads((ROOT / "challenge/catalog.json").read_text())
 WORKLOADS = json.loads((ROOT / "challenge/workloads.json").read_text())
@@ -19,7 +19,7 @@ def model():
     return Model(CATALOG, WORKLOADS)
 
 
-def run_sim(seed=1, carbon_aware=True, margin=1.4, hours=120):
+def run_sim(seed=1, carbon_aware=True, margin=1.25, hours=120):
     m = model()
     env = FakeEnv(m, WORKLOADS, seed)
     ctl = Controller(env, m, carbon_aware=carbon_aware, margin=margin, log=lambda *_: None)
@@ -100,6 +100,30 @@ class EndToEnd(unittest.TestCase):
             base, _ = run_sim(seed, False)
             self.assertEqual(base.late(), {})
             self.assertLess(smart.carbon, base.carbon, f"seed {seed}")
+
+
+class PauseValueAndParking(unittest.TestCase):
+    def test_excess_and_dirty_stretch(self):
+        clean = [50.0] * 6 + [300.0] * 18
+        self.assertEqual(excess(10, 90, 1, clean), 0.0)              # clean hour: nothing to gain
+        self.assertGreater(excess(10, 90, 1, [300.0] + clean), 1.0)  # far above the run threshold
+        self.assertEqual(dirty_run_h(10, 90, 1, [300.0] * 5 + clean), 5)
+
+    def test_only_cheap_to_restart_jobs_are_parked_and_restarts_stay_legal(self):
+        for seed in (1, 2):
+            env, ctl = run_sim(seed)
+            parked = {}
+            for t, ev, name, zone in env.log:
+                if ev == "create" and name != "orch-starter":
+                    wid = name[5:].rsplit("-", 2)[0]
+                    parked[wid] = parked.get(wid, 0) + 1
+            for wid, n in parked.items():
+                w = ctl.m.workloads[wid]
+                if n > int(w["max_workers"]):        # recreated -> must be a portable job
+                    self.assertFalse(w["restart_from_zero"], wid)
+                    self.assertLessEqual(w["checkpoint_seconds"], 1800, wid)
+                    self.assertLessEqual(w["input_seconds"], 900, wid)
+            self.assertEqual(env.late(), {}, f"seed {seed}")
 
 
 class EndedRun(unittest.TestCase):

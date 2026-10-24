@@ -6,10 +6,17 @@ work status and its currently published electricity forecast):
 * Placement  - for every workload pick the legal (zone, profile) with the
   lowest expected carbon for the remaining work, preferring plans that leave
   slack for pausing and small footprints (shared vCPU/GPU quota).
-* Timing     - a VM only exists/runs during the cleanest hours of the next
-  day.  The run-share q is derived from the slack to the deadline; stopped VMs
-  draw no power but keep their quota.  Jobs with little slack run
-  continuously, and are scaled out to more workers if they fall behind.
+* Timing     - a VM only runs during the cleanest hours of the next day.  The
+  run-share q is derived from the slack to the deadline; stopped VMs draw no
+  power but keep their quota.  Jobs with little slack run continuously, and are
+  scaled out to more workers if they fall behind.
+* Quota      - while quota is short ("pressure") holders normally keep running
+  so waiting jobs get capacity.  A holder may still pause if that saves a lot of
+  carbon per vCPU of quota it blocks (energy-dense GPU VMs in a dirty hour), but
+  never while a waiting job is running out of slack ("crunch").
+* Parking    - jobs that checkpoint often and stage little input are deleted
+  instead of stopped for longer dirty stretches: they hold no quota while they
+  wait and restart in the then-cleanest legal zone.
 * Cleanup    - VMs are deleted as soon as the final output is delivered.
 """
 from __future__ import annotations
@@ -20,31 +27,40 @@ import time
 from datetime import timedelta
 from pathlib import Path
 
-from .core import (HOUR, Illegal, Model, Usage, decide_run, eff_rate, over_quota,
+from .core import (HOUR, Illegal, Model, Usage, decide_run, dirty_run_h, eff_rate, excess, over_quota,
                    min_footprint, parse_ts, pick, rank_options, rate_per_hour, workers_needed)
 
 END_STATES = {"COMPLETED", "INVALIDATED", "UNAVAILABLE"}
-PRESSURE_H = 8.0        # only workloads releasing within this many hours create quota pressure
+PRESSURE_H = 8.0       # only workloads releasing within this many hours create quota pressure
 RESERVE_H = 36.0       # reserve quota for urgent workloads released within this many hours
-DWELL_H = 0.9          # minimum virtual hours between start/stop toggles
+DWELL_H = 0.4          # minimum virtual hours between start/stop toggles (stop/start itself is free)
+MARGIN = 1.25          # run-share safety factor: q = needed time / time left x MARGIN
+PAUSE_VALUE = 0.1      # g CO2e per hour and per held vCPU a pause must save while quota is short
+CRUNCH_H = 20.0        # a waiting job with less slack than this blocks all voluntary pauses
+PARK_CKPT_S = 1800     # "portable" jobs: checkpoint at least every 30 min ...
+PARK_INPUT_S = 900     # ... and at most 15 min of input staging per new VM
+PARK_LAX_H = 12.0      # never park a job with less than this slack
+PARK_MIN_H = 4         # park only if the forecast says the job would wait at least this long
+PARK_COOLDOWN_H = 2.0  # a (re)started VM runs at least this long before it may be parked
 NAME = re.compile(r"^orch-(?P<wid>w-[a-z0-9-]+?)-(?P<n>\d+)-p(?P<pid>\d+)$")
 
 
 class Controller:
-    def __init__(self, env, model: Model, *, carbon_aware=True, margin=1.4,
+    def __init__(self, env, model: Model, *, carbon_aware=True, margin=MARGIN, park=True,
                  exclude=(), state_path=None, log=print):
         self.env, self.m = env, model
-        self.carbon_aware, self.margin = carbon_aware, margin
+        self.carbon_aware, self.margin, self.park = carbon_aware, margin, park
         self.exclude, self.log = set(exclude), log
         self.state_path = Path(state_path) if state_path else None
         self.vms: dict[str, list[dict]] = {}
+        self.gen: dict[str, int] = {}          # next VM number per workload (names stay unique after parking)
         self.starter: dict | None = None
         self.done: set[str] = set()
         self.last_change: dict = {}
         self.series: dict[str, list[float]] = {}
         self.ci_mean: dict[str, float] = {}
         self._grid_hour = None
-        self.pressure = False
+        self.pressure = self.crunch = False
         self._load()
 
     # ---------------------------------------------------------------- state
@@ -52,13 +68,14 @@ class Controller:
         if self.state_path and self.state_path.exists():
             d = json.loads(self.state_path.read_text())
             self.vms, self.starter = d.get("vms", {}), d.get("starter")
+            self.gen = d.get("gen", {})
 
     def _save(self):
         if not self.state_path:
             return
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"vms": self.vms, "starter": self.starter}, indent=1))
+        tmp.write_text(json.dumps({"vms": self.vms, "starter": self.starter, "gen": self.gen}, indent=1))
         tmp.replace(self.state_path)
 
     def adopt(self):
@@ -74,6 +91,7 @@ class Controller:
                 pid = next((i for i in self.m.profiles if i.endswith(mt["pid"].zfill(2))), None)
                 self.vms.setdefault(mt["wid"], []).append(
                     {"id": row["id"], "zone": row["zone"], "pid": pid, "name": row["name"], "run": True})
+                self.gen[mt["wid"]] = max(self.gen.get(mt["wid"], 0), int(mt["n"]) + 1)
         self._save()
 
     def usage(self) -> Usage:
@@ -147,7 +165,7 @@ class Controller:
         sw = {w["id"]: w for w in st["workloads"]}
         assign = {a["vm_id"]: a["state"] for w in st["workloads"] for a in w.get("assignments", [])}
         for wid, s in sw.items():
-            if s["final_output_delivered"] and wid not in self.done:
+            if s["final_output_delivered"] and (wid not in self.done or self.vms.get(wid)):
                 self._delete_workload(wid)
                 self.done.add(wid)
         self._refresh_grid(now)
@@ -165,7 +183,7 @@ class Controller:
         vms = self.vms.get(w["id"], [])
         to_dl = (parse_ts(w["deadline_at"]) - now).total_seconds() / HOUR
         out_h = w["output_seconds"] / HOUR
-        staged = completed > 0
+        staged = completed > 0      # same view before and after a restart, so a parked job does not flap
         plan = None
         if vms:
             p = self.m.profiles[vms[0]["pid"]]
@@ -175,7 +193,7 @@ class Controller:
             opts = rank_options(self.m, w, now, completed, self.ci_mean, self.exclude)
             plan = pick(opts)
             if plan is None:
-                return {"laxity": -1e9, "plan": None}
+                return {"laxity": -1e9, "plan": None, "completed": completed}
             p = self.m.profiles[plan.pid]
             rate, zone = rate_per_hour(p), plan.zone
         rem_h = (required - completed) / rate
@@ -187,14 +205,19 @@ class Controller:
     def _pressure(self, todo, plans, now) -> bool:
         """True while the VMs we hold plus the VMs the still-unadmitted workloads
         need would exceed the quotas.  Stopped VMs keep their quota, so pausing
-        under pressure would only delay the workloads waiting for capacity."""
-        u = self.usage()
+        under pressure delays the workloads waiting for capacity.  Also sets
+        `crunch` when the waiting jobs that are short of slack alone do not fit."""
+        u, urgent = self.usage(), self.usage()
         for wid in todo:
             a = plans[wid]
             rel = parse_ts(self.m.workloads[wid]["release_at"])
-            if (not self.vms.get(wid) and a["plan"] is not None
-                    and (rel - now).total_seconds() < PRESSURE_H * HOUR):
-                u.add(a["p"])
+            if self.vms.get(wid) or a["plan"] is None or (rel - now).total_seconds() >= PRESSURE_H * HOUR:
+                continue
+            if not (self.park and a["completed"] > 0 and a["laxity"] > PARK_LAX_H):
+                u.add(a["p"])                   # (a parked job waits on purpose for its clean hours)
+            if a["laxity"] < CRUNCH_H:
+                urgent.add(a["p"])
+        self.crunch = over_quota(self.m, urgent)
         return over_quota(self.m, u)
 
     # ---------------------------------------------------------------- action
@@ -212,11 +235,12 @@ class Controller:
             return
         series = self.series.get(self.m.zones[a["zone"]]["electricity_area"], []) if self.carbon_aware else []
         run, forced = decide_run(a["rem_h"], a["to_dl"], a["out_h"], series, self.margin)
-        if self.pressure:
-            run = True
+        parked = not vms and a["completed"] > 0 and self._portable(w, a)
+        if self.pressure and not run and not parked:   # a parked job waits for its own clean hours
+            run = not (vms and not self.crunch and self._pause_value(a, series) > PAUSE_VALUE)
         if not vms:
             if run:
-                self._create(w, a["plan"], now)
+                self._create(w, now)
             return
         if forced:
             self._scale_out(w, a, now)
@@ -224,15 +248,51 @@ class Controller:
             prev = vms[0]["run"]
             if run != prev and (now - self.last_change.get(wid, now - timedelta(days=9))).total_seconds() < DWELL_H * HOUR:
                 run = prev
+            since = (now - self.last_change.get(wid, now - timedelta(days=9))).total_seconds() / HOUR
+            if (not run and self._portable(w, a) and all(assign.get(v["id"]) != "creating" for v in vms)
+                    and since >= PARK_COOLDOWN_H
+                    and dirty_run_h(a["rem_h"], a["to_dl"], a["out_h"], series, self.margin) >= PARK_MIN_H):
+                self._park(wid, now, assign)
+                return
         self._power(wid, run, now, assign, force=forced)
 
-    def _create(self, w, plan_opt, now):
+    def _pause_value(self, a, series) -> float:
+        """Carbon a pause saves per hour and per vCPU of quota the paused VM keeps blocked
+        (g/h/vCPU): intensity above the job's own run threshold x active watts x PUE / vCPUs.
+        Energy-dense GPU VMs in a dirty hour score high, CPU VMs in a flat grid score ~0."""
+        if not series:
+            return 0.0
+        ex = excess(a["rem_h"], a["to_dl"], a["out_h"], series, self.margin)
+        p, pue = a["p"], float(self.m.zones[a["zone"]]["pue"])
+        return series[0] * ex / (1.0 + ex) * float(p["active_watts"]) * pue / p["cpu_cores"] / 1000.0
+
+    def _portable(self, w, a) -> bool:
+        """Cheap to restart: frequent checkpoints, short input staging, progress survives
+        deletion.  Such a job is deleted ("parked") instead of stopped during long dirty
+        stretches, so it holds no quota while it waits and can restart in the then-cleanest zone."""
+        return (self.park and self.carbon_aware and w["kind"] == "cpu" and not w["restart_from_zero"]
+                and 0 < int(w["checkpoint_seconds"]) <= PARK_CKPT_S and int(w["input_seconds"]) <= PARK_INPUT_S
+                and a["laxity"] > PARK_LAX_H)
+
+    def _park(self, wid, now, assign):
+        if self._delete_workload(wid, why="parked"):
+            self.log(f"{wid}: parked at {now:%d %H:%M} virtual")
+        else:
+            self._power(wid, False, now, assign)          # could not delete: at least stop it
+        self.last_change[wid] = now
+
+    def _create(self, w, now):
         wid = w["id"]
         usage = self._with_reservations(wid, now)
-        opts = rank_options(self.m, w, now, 0.0, self.ci_mean, self.exclude)
+        opts = rank_options(self.m, w, now, self._plans[wid]["completed"], self.ci_mean, self.exclude)
         o = pick(opts, self.m, usage)
         if o is None:
             return                              # wait for quota
+        if self._plans[wid]["completed"] > 0 and self._portable(w, self._plans[wid]):
+            # a parked job has slack: wait for room for its efficient VM instead of a worse fallback
+            best = pick(opts)
+            if best and o.cost > best.cost * 1.03:
+                return
         self._spawn(w, o.zone, o.pid)
         self.last_change[wid] = now
 
@@ -248,7 +308,7 @@ class Controller:
                 continue
             if (parse_ts(wo["release_at"]) - now).total_seconds() >= RESERVE_H * HOUR:
                 continue
-            opts = rank_options(self.m, wo, now, 0.0, self.ci_mean, self.exclude)
+            opts = rank_options(self.m, wo, now, a["completed"], self.ci_mean, self.exclude)
             tight = int(wo["max_workers"]) == 1 and min(o.ratio for o in opts) > 0.4
             if a["laxity"] < mine or tight:
                 o = min_footprint(opts)
@@ -258,7 +318,8 @@ class Controller:
 
     def _spawn(self, w, zone, pid):
         self.m.assert_legal(w, zone, pid)       # hard stop before any API call
-        n = len(self.vms.get(w["id"], []))
+        n = self.gen.get(w["id"], 0)
+        self.gen[w["id"]] = n + 1
         name = f"orch-{w['id']}-{n}-p{pid[-2:]}"
         p = self.m.profiles[pid]
         vid = self.env.create(zone, p, w["id"], name)
@@ -297,14 +358,21 @@ class Controller:
             self.log(f"{wid}: {'resume' if run else 'pause'} at {now:%d %H:%M} virtual")
 
     # --------------------------------------------------------------- cleanup
-    def _delete_workload(self, wid):
+    def _delete_workload(self, wid, why="") -> bool:
+        """Delete all VMs of a workload; VMs whose delete failed stay tracked (and are
+        retried next tick) so they keep counting against quota and never run unnoticed."""
+        left = []
         for v in self.vms.pop(wid, []):
             try:
                 self.env.delete(v["zone"], v["id"])
-                self.log(f"{wid}: deleted {v['name']}")
+                self.log(f"{wid}: deleted {v['name']}" + (f" ({why})" if why else ""))
             except Exception as e:                      # e.g. 409 once the run has finished
                 self.log(f"{wid}: delete of {v['name']} failed: {e!r}")
+                left.append(v)
+        if left:
+            self.vms[wid] = left
         self._save()
+        return not left
 
     def cleanup_all(self):
         for wid in list(self.vms):
@@ -318,7 +386,7 @@ class Controller:
             self._save()
 
 
-def run_loop(ctl: Controller, poll=1.0, log=print):
+def run_loop(ctl: Controller, poll=0.5, log=print):
     ctl.adopt()
     errors = 0
     while True:

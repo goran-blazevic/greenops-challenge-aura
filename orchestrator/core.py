@@ -14,6 +14,8 @@ HOUR = 3600.0
 # Feasibility tiers: share of the available window that a plan may occupy.
 # A small share leaves room to pause the VM during dirty hours.
 TIERS = (0.55, 0.85, 0.97)
+SHARE_MIN = 0.2      # never plan to run in fewer than 20 % of the hours
+NEAR_TIE = 1.005     # plans within this cost factor count as ties -> smaller VM (efficiency first)
 
 
 def parse_ts(s: str) -> datetime:
@@ -136,9 +138,12 @@ def rank_options(m: Model, w: dict, now: datetime, completed: float, ci_mean: di
     for slug, p in m.options(w, exclude):
         z = m.zones[slug]
         work_h = remaining / rate_per_hour(p)
-        ratio = (work_h + over_h + float(p["boot_seconds"]) / HOUR) / window_h
+        boot_h = float(p["boot_seconds"]) / HOUR
+        ratio = (work_h + over_h + boot_h) / window_h
         ci = ci_mean.get(z["electricity_area"], 1.0)
-        cost = float(z["pue"]) * ci * float(p["active_watts"]) / 1000.0 * work_h
+        # IT energy of the remaining work plus the idle boot/staging/output phases
+        kwh = (float(p["active_watts"]) * work_h + float(p["idle_watts"]) * (over_h + boot_h)) / 1000.0
+        cost = float(z["pue"]) * ci * kwh
         fp = p["cpu_cores"] + 1000 * p["gpu_count"]
         out.append(Option(slug, p["id"], ratio, cost, fp))
     return out
@@ -152,7 +157,7 @@ def pick(options: list[Option], m: Model | None = None, usage: Usage | None = No
         tier = [o for o in options if o.ratio <= lim and fits(o)]
         if tier:
             best = min(o.cost for o in tier)
-            near = [o for o in tier if o.cost <= best * 1.03 + 1e-12]
+            near = [o for o in tier if o.cost <= best * NEAR_TIE + 1e-12]
             return min(near, key=lambda o: (o.footprint, o.cost))
     if usage is not None and any(o.ratio <= TIERS[-1] for o in options):
         return None          # a safe plan exists but does not fit the quota yet: wait, never take a doomed one
@@ -176,8 +181,20 @@ def quantile(vals: list[float], q: float) -> float:
     return s[lo] + (s[hi] - s[lo]) * (x - lo)
 
 
+def _threshold(remaining_h: float, hours_to_deadline: float, output_h: float,
+               series: list[float], margin: float):
+    """(usable hours, run threshold) - the job runs while the current hour is among the
+    cleanest q share of the forecast window, q = needed time / usable time x margin."""
+    guard = 3.0 + 0.04 * max(hours_to_deadline, 0.0)
+    t_avail = hours_to_deadline - output_h - guard
+    if t_avail <= 0 or len(series) < 4:
+        return t_avail, None
+    q = min(1.0, max(SHARE_MIN, remaining_h / t_avail * margin))
+    return t_avail, quantile(series[: max(4, min(len(series), int(t_avail)))], q)
+
+
 def decide_run(remaining_h: float, hours_to_deadline: float, output_h: float,
-               series: list[float], margin: float = 1.4) -> tuple[bool, bool]:
+               series: list[float], margin: float = 1.25) -> tuple[bool, bool]:
     """Return (run_now, forced).
 
     remaining_h: compute (+ staging) hours still needed at the current rate.
@@ -185,15 +202,34 @@ def decide_run(remaining_h: float, hours_to_deadline: float, output_h: float,
     The VM runs in the cleanest `q` share of the next hours, where q is the
     share of time the job needs until its deadline (times a safety margin).
     """
-    guard = 3.0 + 0.04 * max(hours_to_deadline, 0.0)
-    t_avail = hours_to_deadline - output_h - guard
+    t_avail, thr = _threshold(remaining_h, hours_to_deadline, output_h, series, margin)
     if t_avail <= 0 or remaining_h >= 0.8 * t_avail:
         return True, True
-    if len(series) < 4:
+    if thr is None:
         return True, False
-    q = min(1.0, max(0.2, remaining_h / t_avail * margin))
-    window = series[: max(4, min(len(series), int(t_avail)))]
-    return series[0] <= quantile(window, q) + 1e-9, False
+    return series[0] <= thr + 1e-9, False
+
+
+def excess(remaining_h: float, hours_to_deadline: float, output_h: float,
+           series: list[float], margin: float = 1.25) -> float:
+    """How much dirtier the current hour is than the job's run threshold
+    (0.25 = 25 % above it); 0 when it should run anyway."""
+    _, thr = _threshold(remaining_h, hours_to_deadline, output_h, series, margin)
+    return max(0.0, series[0] / thr - 1.0) if thr else 0.0
+
+
+def dirty_run_h(remaining_h: float, hours_to_deadline: float, output_h: float,
+                series: list[float], margin: float = 1.25) -> int:
+    """Forecast hours from now until the job would want to run again."""
+    _, thr = _threshold(remaining_h, hours_to_deadline, output_h, series, margin)
+    if thr is None:
+        return 0
+    n = 0
+    for v in series:
+        if v <= thr + 1e-9:
+            break
+        n += 1
+    return n
 
 
 def workers_needed(remaining: float, hours_avail: float, p: dict, w: dict) -> int:
