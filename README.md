@@ -36,14 +36,15 @@ On launch, the controller creates `.local/greenops-memory-<run-hash>.sqlite3` (o
 
 Keep the process open until it reports all workloads delivered and VMs cleaned up. The run receipt is also endpoint-scoped. After a crash, resume with the same run credentials. For orchestrator-owned VM cleanup after an interruption: `python -m orchestrator.run cleanup --config greenops-exo.json`. Do not use old credentials that were exposed in chat.
 
-### Score-aware scheduling (v11)
+### Score-aware scheduling (v13)
 
-v11 keeps the score-v2 scheduler and sets `--score-aware-beta 0.05` as the default, matching the command used for Aura's task13 run. It reads public per-workload reference energies from `challenge/rules.json` and the workload's current estimated electricity emissions from this run's currently published forecast, then computes the score's marginal value per gram. The beta adjusts each workload's run margin so cleaner forecast hours are preferentially offered to work where they are worth more leaderboard points. It does not read or store future data. Pass `--score-aware-beta 0` to restore v9 scheduling exactly.
+v13 keeps score-aware beta opt-in (default `0.0`) and softens workload-class run margins: large-input two-worker CPU jobs `0.80`; portable parallel CPU jobs `1.30` / `1.20`; single-worker jobs with long output phases `1.50`; zero-input checkpointable CPU jobs `1.00`. Restart-from-zero jobs retain the existing deadline-safety floor. The long-output rule now covers any single-worker CPU workload with an output phase of at least one hour, rather than only Swiss-residency jobs.
 
-Aura's task13 run, using beta 0.05, scored 22,087.47 with all 15 workloads delivered, 12.796445 kg electricity emissions and 21.902045 kg total impact. That's the best reported Aura score so far. **It does not prove beta 0.05 caused the gain:** replaying the same task13 data does not reproduce a consistent score advantage over beta 0, and the grid/polling variation between real attempts is material. The setting is retained as a measured candidate, not a win guarantee.
+Why: task14 delivered 15/15 but scored 22,086.827, 0.647 points below task13. Electricity emissions rose 13.208 g while lifecycle emissions fell 19.067 g. The largest point losses were w-14 (−8.28), w-09 (−3.18), w-15 (−2.41), and w-11 (−1.83). The task14 memory recorded 218 pause/resume pairs versus 100 in task13; this is a churn signal, not proof that churn caused the score change.
 
-All 32 tests pass. Replay comparisons are approximate, depend on the polling cadence, and are not a live score. A fresh run is required to test it; do not reuse another run's SQLite memory.
+In approximate task13 and task14 replay comparisons, the v13 margin candidate averaged 22,104.4 and 22,104.8 respectively, about 13.5 points above the corresponding v12 replay results. It completed all 15 workloads in the seven cadence variants per run and in 96 seeds for each of two synthetic grid families. These replays are not live leaderboard results. The task14 live result remains the latest confirmed run; v13 has not been tested on a fresh live run and does not guarantee a win.
 
+All 32 unit tests pass. Use fresh run credentials and a new run-scoped SQLite database for each attempt.
 ## 1. Download your credentials
 
 Sign in at [greenops.containerstack.net](https://greenops.containerstack.net),

@@ -23,7 +23,7 @@ from .core import Model, parse_ts, pick, rank_options
 from .memory import RunMemory
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SCORE_AWARE_BETA = 0.05
+DEFAULT_SCORE_AWARE_BETA = 0.0
 
 
 def load_model() -> Model:

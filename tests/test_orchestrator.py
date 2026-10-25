@@ -159,9 +159,9 @@ class GpuCrunch(unittest.TestCase):
 
 
 class ScoreAwarePolicy(unittest.TestCase):
-    def test_cli_default_matches_measured_score_aware_run(self):
+    def test_cli_default_keeps_score_adjustment_opt_in(self):
         from orchestrator.run import DEFAULT_SCORE_AWARE_BETA
-        self.assertEqual(DEFAULT_SCORE_AWARE_BETA, 0.05)
+        self.assertEqual(DEFAULT_SCORE_AWARE_BETA, 0.0)
 
     def test_zero_beta_preserves_legacy_margin_policy(self):
         from orchestrator import controller as C

@@ -34,8 +34,14 @@ END_STATES = {"COMPLETED", "INVALIDATED", "UNAVAILABLE"}
 PRESSURE_H = 8.0       # only workloads releasing within this many hours create quota pressure
 RESERVE_H = 36.0       # reserve quota for urgent workloads released within this many hours
 DWELL_H = 0.0          # apply current published forecast at every controller poll
-MARGIN = 1.05          # CPU run-share safety factor
+MARGIN = 0.98          # CPU run-share safety factor; class rules override selected job shapes
 GPU_MARGIN = 0.85      # GPUs favor cleaner hours; task11 replay candidate
+CLASS_MARGIN_POLICY = True
+CLASS_MARGIN_BIG_INPUT_CPU = 0.80
+CLASS_MARGIN_PARALLEL_SMALL_INPUT = 1.30
+CLASS_MARGIN_PARALLEL_CPU = 1.20
+CLASS_MARGIN_LONG_OUTPUT_CPU = 1.50
+CLASS_MARGIN_ZERO_INPUT_CHECKPOINT_CPU = 1.00
 HIST_H = 72           # hours of this run's published history used for the long-horizon zone estimate
 CRUNCH_H_GPU = 18.0    # separate crunch threshold for waiting GPU jobs (single-worker, long staging)
 URGENT_H = 14.0        # a requester with less slack ignores mutual 'tight' reservations
@@ -231,7 +237,34 @@ class Controller:
             if option is None:
                 continue
             projected_g = max(0.0, float(option.electricity_g))
-            values[wid] = (ref_g / (ref_g + projected_g)) ** 2
+            local_weight = float(getattr(self.m, "score_local_weight", 0.75))
+            base_points = float(getattr(self.m, "score_base_points", 20000.0))
+            reference_sum_g = sum(float(v) for v in refs.values()) * float(
+                getattr(self.m, "reference_gco2e_per_kwh", 200.0)
+            )
+            local_value = (
+                local_weight * base_points / max(reference_sum_g, 1.0)
+                * (ref_g / (ref_g + projected_g)) ** 2
+            )
+            values[wid] = local_value
+        # The 25% run-wide quality term adds the same marginal value to every
+        # workload gram. Keep it in the sensitivity weight so score-aware
+        # scheduling doesn't over-prioritize local terms.
+        if values:
+            shared_weight = float(getattr(self.m, "score_shared_weight", 0.25))
+            base_points = float(getattr(self.m, "score_base_points", 20000.0))
+            reference_sum_g = sum(float(v) for v in refs.values()) * float(
+                getattr(self.m, "reference_gco2e_per_kwh", 200.0)
+            )
+            projected_total = sum(
+                max(0.0, float(plans[wid].get("plan").electricity_g))
+                for wid in todo if plans[wid].get("plan") is not None
+            )
+            shared_value = (
+                shared_weight * base_points * reference_sum_g
+                / max(reference_sum_g + projected_total, 1.0) ** 2
+            )
+            values = {wid: value + shared_value for wid, value in values.items()}
         if not values:
             return {}
         mean_value = sum(values.values()) / len(values)
@@ -304,6 +337,27 @@ class Controller:
         margin = self._score_margins.get(
             wid, GPU_MARGIN if w["kind"] == "gpu" and GPU_MARGIN is not None else self.margin
         )
+        if CLASS_MARGIN_POLICY and w["kind"] == "cpu":
+            workers = int(w.get("max_workers", 1))
+            input_s = int(w.get("input_seconds", 0))
+            checkpoint_s = int(w.get("checkpoint_seconds", 0))
+            output_s = int(w.get("output_seconds", 0))
+            # Long staging can be deferred while waiting for high-carbon forecast
+            # hours; don't let it steal quota from released single-worker GPU jobs.
+            if workers == 2 and input_s >= 7200:
+                margin = CLASS_MARGIN_BIG_INPUT_CPU
+            # Portable, checkpointable CPU batches can run through less-clean
+            # intervals without stranding a single-worker deadline-critical job.
+            elif workers >= 6 and checkpoint_s <= 900 and input_s <= 300:
+                margin = CLASS_MARGIN_PARALLEL_SMALL_INPUT
+            elif workers >= 8 and checkpoint_s <= 1800 and input_s <= 900:
+                margin = CLASS_MARGIN_PARALLEL_CPU
+            elif workers == 1 and output_s >= 3600:
+                margin = CLASS_MARGIN_LONG_OUTPUT_CPU
+            elif input_s == 0 and workers >= 4 and checkpoint_s <= 1800:
+                margin = CLASS_MARGIN_ZERO_INPUT_CHECKPOINT_CPU
+            if w.get("restart_from_zero", False):
+                margin = max(margin, 2.00)
         run, forced = decide_run(a["rem_h"], a["to_dl"], a["out_h"], series, margin)
         parked = not vms and a["completed"] > 0 and self._portable(w, a)
         if self.pressure and not run and not parked:   # a parked job waits for its own clean hours
@@ -359,6 +413,15 @@ class Controller:
         usage = self._with_reservations(wid, now)
         opts = rank_options(self.m, w, now, self._plans[wid]["completed"], self.ci_mean, self.exclude)
         o = pick(opts, self.m, usage)
+        # Reservations are advisory, unlike running VMs. If they crowd out a
+        # released, single-worker job with shrinking deadline slack, let it use
+        # otherwise-free real quota rather than waiting for an impossible reserve.
+        # Never exceed actual simulator quotas: the fallback rechecks actual use.
+        if (o is None and w.get("restart_from_zero", False)
+                and int(w.get("max_workers", 1)) == 1
+                and int(w.get("checkpoint_seconds", 0)) == 0
+                and self._plans[wid].get("laxity", float("inf")) <= 60.0):
+            o = pick(opts, self.m, self.usage())
         if opts and min(x.ratio for x in opts) > RESCUE_RATIO:
             # Late admission: never commit to an undersized worker because it is all
             # that fits; admit a complete deadline-feasible worker group instead.

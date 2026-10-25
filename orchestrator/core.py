@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+from fractions import Fraction
 
 HOUR = 3600.0
 # Feasibility tiers: share of the available window that a plan may occupy.
@@ -45,11 +46,17 @@ class Model:
         try:
             rules = json.loads(rules_path.read_text())["rules"]
             self.reference_gco2e_per_kwh = float(rules.get("reference_gco2e_per_kwh", 200.0))
+            self.score_base_points = float(rules.get("base_points", 20000.0))
+            self.score_local_weight = float(Fraction(str(rules.get("local_weight", "0.75"))))
+            self.score_shared_weight = float(Fraction(str(rules.get("shared_weight", "0.25"))))
             self.reference_energy_kwh = {
                 wid: float(kwh) for wid, kwh in rules.get("reference_energy_kwh", {}).items()
             }
         except (OSError, ValueError, KeyError, TypeError):
             self.reference_gco2e_per_kwh = 200.0
+            self.score_base_points = 20000.0
+            self.score_local_weight = 0.75
+            self.score_shared_weight = 0.25
             self.reference_energy_kwh = {}
 
     # ---- legality (checked twice: when ranking and right before create) ----

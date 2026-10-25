@@ -1,10 +1,10 @@
-# Carbon-aware orchestrator
+# Carbon-aware orchestrator (Aura v13)
 
 Controls all 15 workloads of the GreenOps challenge.  Code: `core.py` (pure decisions),
 `controller.py` (loop, quota handling, VM lifecycle), `cloud.py` (Exoscale binding + grid API),
 `run.py` (CLI).  Tests: `tests/test_orchestrator.py` with an offline stand-in simulator
 (`tests/fake_env.py`, synthetic electricity - never real or run data).
-Policy benchmark: `python tests/bench.py` (many random synthetic grids, see below). Rechecked in this workspace on 48 paired seeds.
+Policy benchmark: `python tests/bench.py` (many random synthetic grids, see below). v13 refines class-based run margins and protects long-output single-worker jobs. A controlled 96-seed check per synthetic grid family completed all workloads.
 
 ## Run (inside the starter container, fresh run credentials in `greenops-exo.json`)
 
