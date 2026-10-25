@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/score.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "version": {
+      "enum": [
+        "greenops-score-v1",
+        "greenops-score-v2"
+      ]
+    },
+    "rules_hash": {
+      "type": "string"
+    },
+    "score_as_of": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "final": {
+      "type": "boolean"
+    },
+    "base": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d{6}$"
+    },
+    "bonus": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d{6}$"
+    },
+    "total": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d{6}$"
+    },
+    "total_gco2e": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d{6}$"
+    },
+    "contributions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "progress": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          },
+          "delivered": {
+            "type": "boolean"
+          },
+          "carbon_gco2e": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          },
+          "points": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          },
+          "usage_gco2e": {
+            "type": "string",
+            "pattern": "^[0-9]+(?:\\.[0-9]+)?$"
+          },
+          "lifecycle_gco2e": {
+            "type": "string",
+            "pattern": "^[0-9]+(?:\\.[0-9]+)?$"
+          },
+          "scored_gco2e": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          }
+        },
+        "required": [
+          "id",
+          "progress",
+          "delivered",
+          "carbon_gco2e",
+          "points"
+        ]
+      }
+    },
+    "usage_gco2e": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:\\.[0-9]+)?$"
+    },
+    "lifecycle_gco2e": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:\\.[0-9]+)?$"
+    },
+    "impact_basis": {
+      "const": "electricity_usage"
+    },
+    "scored_gco2e": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d{6}$"
+    }
+  },
+  "required": [
+    "version",
+    "rules_hash",
+    "score_as_of",
+    "final",
+    "base",
+    "bonus",
+    "total",
+    "total_gco2e",
+    "contributions"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "version": {
+            "const": "greenops-score-v2"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "impact_basis",
+          "scored_gco2e",
+          "usage_gco2e",
+          "lifecycle_gco2e"
+        ],
+        "properties": {
+          "contributions": {
+            "items": {
+              "required": [
+                "scored_gco2e",
+                "usage_gco2e",
+                "lifecycle_gco2e"
+              ]
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "impact_basis": false,
+          "scored_gco2e": false
+        }
+      }
+    }
+  ]
+}

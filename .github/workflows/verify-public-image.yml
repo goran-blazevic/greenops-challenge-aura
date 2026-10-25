@@ -1,0 +1,30 @@
+name: Verify anonymous image pull
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  pull-and-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pull without registry credentials and check the toolchain
+        env:
+          DOCKER_CONFIG: ${{ runner.temp }}/anonymous-docker
+        shell: bash
+        run: |
+          mkdir -p "$DOCKER_CONFIG"
+          printf '{"auths":{}}\n' > "$DOCKER_CONFIG/config.json"
+          image=ghcr.io/exogmi/greenops-challenge-starter-kit:latest
+          docker pull "$image"
+          docker image inspect "$image" --format '{{json .RepoDigests}}'
+          docker run --rm "$image" sh -ec '
+            exo version
+            terraform version
+            go version
+            python -c "import exoscale; print(exoscale.__version__)"
+            greenops-static -h
+            python /opt/greenops-starter/examples/python/static.py --help
+            terraform -chdir=/opt/greenops-starter/examples/terraform validate
+            test ! -e /opt/greenops-starter/.local
+            test ! -e /opt/greenops-starter/greenops-exo.json
+          '

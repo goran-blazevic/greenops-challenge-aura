@@ -1,0 +1,8 @@
+# Submission image: starter toolchain + the orchestrator. Pin the base digest when you submit.
+FROM ghcr.io/exogmi/greenops-challenge-starter-kit:latest
+COPY orchestrator /opt/greenops-starter/orchestrator
+WORKDIR /opt/greenops-starter
+ENV GREENOPS_STATE=/tmp/greenops-orch.json
+# Credentials arrive as EXOSCALE_API_KEY / EXOSCALE_API_SECRET / GREENOPS_CLOUD_ENDPOINT and
+# GREENOPS_GRID_ENDPOINT / GREENOPS_GRID_SECRET; nothing secret is baked in.
+ENTRYPOINT ["python", "-m", "orchestrator.run", "run"]

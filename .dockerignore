@@ -1,0 +1,10 @@
+.git
+.venv
+.local
+**/__pycache__
+**/.terraform
+**/*.tfstate*
+**/*.tfvars
+.env*
+greenops-exo*.json
+credentials*.json

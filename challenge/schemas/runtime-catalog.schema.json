@@ -1,0 +1,120 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/runtime-catalog.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "zones": {
+      "type": "array",
+      "items": {
+        "$ref": "https://greenops.invalid/specs/runtime-zone.schema.json"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "$ref": "https://greenops.invalid/specs/runtime-profile.schema.json"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "max_vms": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "max_vcpus": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "gpu_family_quotas": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "scenario_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "provenance": {
+      "type": "string",
+      "minLength": 1
+    },
+    "workloads": {
+      "type": "array",
+      "items": {
+        "$ref": "https://greenops.invalid/specs/runtime-workload.schema.json"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "max_gpus": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "impact_model": {
+      "const": "exoscale-lca-v1"
+    }
+  },
+  "required": [
+    "zones",
+    "profiles",
+    "max_vms",
+    "max_vcpus",
+    "gpu_family_quotas",
+    "scenario_id",
+    "provenance",
+    "workloads"
+  ],
+  "$defs": {
+    "offerings": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "zones": {
+          "type": "array",
+          "items": {
+            "$ref": "https://greenops.invalid/specs/runtime-zone.schema.json"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "profiles": {
+          "type": "array",
+          "items": {
+            "$ref": "https://greenops.invalid/specs/runtime-profile.schema.json"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "max_vms": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_vcpus": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "gpu_family_quotas": {
+          "type": "object",
+          "minProperties": 1,
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "required": [
+        "zones",
+        "profiles",
+        "max_vms",
+        "max_vcpus",
+        "gpu_family_quotas"
+      ]
+    }
+  }
+}

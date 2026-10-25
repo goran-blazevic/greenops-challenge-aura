@@ -1,0 +1,163 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/runtime-workload.schema.json",
+  "title": "Implemented runtime workload; distinct from the broader planned workload bundle format",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "title": {
+      "type": "string",
+      "minLength": 1
+    },
+    "kind": {
+      "enum": [
+        "cpu",
+        "gpu"
+      ]
+    },
+    "required_work": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/positive_decimal"
+    },
+    "work_unit": {
+      "enum": [
+        "vcpu_hour",
+        "tflop"
+      ]
+    },
+    "release_at": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "deadline_at": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "residency": {
+      "anyOf": [
+        {
+          "enum": [
+            "EU",
+            "ANYWHERE"
+          ]
+        },
+        {
+          "type": "string",
+          "pattern": "^[A-Z]{2}$"
+        }
+      ]
+    },
+    "allowed_countries": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "uniqueItems": true
+    },
+    "forbidden_countries": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z]{2}$"
+      },
+      "uniqueItems": true
+    },
+    "allowed_profile_ids": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "allowed_families": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "minimum_gpu_memory_gib": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "max_workers": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 20
+    },
+    "sync_overhead": {
+      "description": "Coordination coefficient per additional active VM: throughput is divided by 1 + sync_overhead * (active_workers - 1). Current definitions and public catalogs use zero when max_workers is 1; legacy saved inputs may retain an ignored nonzero value.",
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/decimal"
+    },
+    "input_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "output_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "checkpoint_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "restart_from_zero": {
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "id",
+    "title",
+    "kind",
+    "required_work",
+    "work_unit",
+    "release_at",
+    "deadline_at",
+    "residency",
+    "allowed_families",
+    "max_workers",
+    "sync_overhead",
+    "input_seconds",
+    "output_seconds",
+    "checkpoint_seconds",
+    "restart_from_zero"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "cpu"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "work_unit": {
+            "const": "vcpu_hour"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "gpu"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "work_unit": {
+            "const": "tflop"
+          }
+        }
+      }
+    }
+  ]
+}

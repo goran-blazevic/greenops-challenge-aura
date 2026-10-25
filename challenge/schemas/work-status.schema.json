@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/work-status.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "type": "string"
+    },
+    "virtual_time": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "speed_multiplier": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 720
+    },
+    "state": {
+      "enum": [
+        "READY",
+        "RUNNING",
+        "PAUSED",
+        "COMPLETED",
+        "UNAVAILABLE",
+        "INVALIDATED"
+      ]
+    },
+    "qualification": {
+      "enum": [
+        "QUALIFIED",
+        "DISQUALIFIED"
+      ]
+    },
+    "workloads": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string"
+          },
+          "required_work": {
+            "type": "string"
+          },
+          "completed_work": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          },
+          "work_unit": {
+            "enum": [
+              "vcpu_hour",
+              "tflop"
+            ]
+          },
+          "lost_work": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d{6}$"
+          },
+          "output_ready_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "succeeded_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "final_output_delivered": {
+            "type": "boolean"
+          },
+          "assignments": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "vm_id": {
+                  "type": "string"
+                },
+                "zone": {
+                  "type": "string"
+                },
+                "state": {
+                  "enum": [
+                    "creating",
+                    "running",
+                    "stopped"
+                  ]
+                }
+              },
+              "required": [
+                "vm_id",
+                "zone",
+                "state"
+              ]
+            }
+          }
+        },
+        "required": [
+          "id",
+          "state",
+          "required_work",
+          "completed_work",
+          "work_unit",
+          "lost_work",
+          "final_output_delivered",
+          "assignments"
+        ]
+      }
+    }
+  },
+  "required": [
+    "run_id",
+    "virtual_time",
+    "speed_multiplier",
+    "state",
+    "qualification",
+    "workloads"
+  ]
+}

@@ -1,0 +1,538 @@
+"""Carbon-aware controller: decides when, where and on what each workload runs.
+
+Policy (all inputs come from the controlled run: public specs, the run's own
+work status and its currently published electricity forecast):
+
+* Placement  - for every workload pick the legal (zone, profile) with the
+  lowest expected carbon for the remaining work, preferring plans that leave
+  slack for pausing and small footprints (shared vCPU/GPU quota).
+* Timing     - a VM only runs during the cleanest hours of the next day.  The
+  run-share q is derived from the slack to the deadline; stopped VMs draw no
+  power but keep their quota.  Jobs with little slack run continuously, and are
+  scaled out to more workers if they fall behind.
+* Quota      - while quota is short ("pressure") holders normally keep running
+  so waiting jobs get capacity.  A holder may still pause if that saves a lot of
+  carbon per vCPU of quota it blocks (energy-dense GPU VMs in a dirty hour), but
+  never while a waiting job is running out of slack ("crunch").
+* Parking    - jobs that checkpoint often and stage little input are deleted
+  instead of stopped for longer dirty stretches: they hold no quota while they
+  wait and restart in the then-cleanest legal zone.
+* Cleanup    - VMs are deleted as soon as the final output is delivered.
+"""
+from __future__ import annotations
+
+import json
+import re
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from .core import (HOUR, Illegal, Model, Usage, decide_run, dirty_run_h, eff_rate, excess, over_quota,
+                   min_footprint, parse_ts, pick, rank_options, rate_per_hour, workers_needed)
+
+END_STATES = {"COMPLETED", "INVALIDATED", "UNAVAILABLE"}
+PRESSURE_H = 8.0       # only workloads releasing within this many hours create quota pressure
+RESERVE_H = 36.0       # reserve quota for urgent workloads released within this many hours
+DWELL_H = 0.0          # apply current published forecast at every controller poll
+MARGIN = 1.05          # CPU run-share safety factor
+GPU_MARGIN = 0.85      # GPUs favor cleaner hours; task11 replay candidate
+HIST_H = 72           # hours of this run's published history used for the long-horizon zone estimate
+CRUNCH_H_GPU = 18.0    # separate crunch threshold for waiting GPU jobs (single-worker, long staging)
+URGENT_H = 14.0        # a requester with less slack ignores mutual 'tight' reservations
+RESCUE_RATIO = 0.85    # past this window share, admit a complete deadline-feasible worker group
+PAUSE_VALUE = 0.1      # g CO2e per hour and per held vCPU a pause must save while quota is short
+CRUNCH_H = 14.0        # a waiting job with less slack than this blocks all voluntary pauses
+PARK_CKPT_S = 900      # only short-checkpoint jobs are restartable enough
+PARK_INPUT_S = 300     # keep restart staging below five minutes
+PARK_LAX_H = 16.0      # require ample deadline slack before parking
+PARK_MIN_H = 8         # park only for genuinely long dirty stretches
+PARK_COOLDOWN_H = 6.0  # prevent repeated delete/re-stage cycles
+NAME = re.compile(r"^orch-(?P<wid>w-[a-z0-9-]+?)-(?P<n>\d+)-p(?P<pid>\d+)$")
+
+
+class Controller:
+    def __init__(self, env, model: Model, *, carbon_aware=True, margin=MARGIN, park=True,
+                 exclude=(), state_path=None, memory=None, score_aware_beta=0.0, log=print):
+        self.env, self.m = env, model
+        self.carbon_aware, self.margin, self.park = carbon_aware, margin, park
+        self.score_aware_beta = max(-1.0, min(1.0, float(score_aware_beta)))
+        self.exclude, self.log = set(exclude), log
+        self.state_path = Path(state_path) if state_path else None
+        self.memory = memory
+        self.vms: dict[str, list[dict]] = {}
+        self.gen: dict[str, int] = {}          # next VM number per workload (names stay unique after parking)
+        self.starter: dict | None = None
+        self.done: set[str] = set()
+        self.last_change: dict = {}
+        self.series: dict[str, list[float]] = {}
+        self.ci_mean: dict[str, object] = {}
+        self._grid_hour = None
+        self.pressure = self.crunch = False
+        self._score_margins: dict[str, float] = {}
+        self._load()
+
+    # ---------------------------------------------------------------- state
+    def _load(self):
+        if self.state_path and self.state_path.exists():
+            d = json.loads(self.state_path.read_text())
+            self.vms, self.starter = d.get("vms", {}), d.get("starter")
+            self.gen = d.get("gen", {})
+
+    def _save(self):
+        if not self.state_path:
+            return
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"vms": self.vms, "starter": self.starter, "gen": self.gen}, indent=1))
+        tmp.replace(self.state_path)
+
+    def adopt(self):
+        """Recover VMs created by an earlier invocation (deterministic names)."""
+        known = {v["id"] for vs in self.vms.values() for v in vs}
+        for row in self.env.adopt():
+            mt = NAME.match(row["name"])
+            if row["id"] in known:
+                continue
+            if row["name"] == "orch-starter":
+                self.starter = {"id": row["id"], "zone": row["zone"], "run": True, "pid": None}
+            elif mt:
+                pid = next((i for i in self.m.profiles if i.endswith(mt["pid"].zfill(2))), None)
+                self.vms.setdefault(mt["wid"], []).append(
+                    {"id": row["id"], "zone": row["zone"], "pid": pid, "name": row["name"], "run": True})
+                self.gen[mt["wid"]] = max(self.gen.get(mt["wid"], 0), int(mt["n"]) + 1)
+        self._save()
+
+    def usage(self) -> Usage:
+        u = Usage()
+        for vs in self.vms.values():
+            for v in vs:
+                u.add(self.m.profiles[v["pid"]])
+        if self.starter and self.starter.get("pid"):
+            u.add(self.m.profiles[self.starter["pid"]])
+        return u
+
+    # ----------------------------------------------------------------- grid
+    def _refresh_grid(self, now):
+        hour = now.replace(minute=0, second=0, microsecond=0)
+        if not self.carbon_aware or hour == self._grid_hour:
+            return
+        self._grid_hour = hour
+        areas = sorted({z["electricity_area"] for z in self.m.zones.values()})
+        batch = getattr(self.env, "forecasts", None)
+        fs = batch(areas) if batch else {a: self.env.forecast(a) for a in areas}
+        histories = self.env.histories(areas) if hasattr(self.env, "histories") else {}
+        for area in areas:
+            f = fs.get(area)
+            if f is None:
+                continue
+            raw = list(f)
+            if self.memory:
+                self.memory.record_forecast(area, now, raw)
+                self.memory.record_history(area, now, histories.get(area, []))
+                f = self.memory.calibrate(area, now, raw)
+            vals = [ci for dt, ci in f if dt >= hour]
+            if vals:
+                self.series[area] = vals
+                forecast_mean = sum(vals[:24]) / len(vals[:24])
+                published_history = [(dt, ci) for dt, ci in histories.get(area, []) if dt < now]
+                hist_values = [float(ci) for _, ci in published_history[-int(HIST_H):]]
+                history_mean = sum(hist_values) / len(hist_values) if hist_values else forecast_mean
+                self.ci_mean[area] = {"forecast_mean": forecast_mean,
+                                      "history_mean": history_mean,
+                                      "history_count": len(hist_values),
+                                      "forecast": [float(v) for v in vals[:24]]}
+        if self.ci_mean:
+            avg = sum(float(v.get("forecast_mean", 1.0)) if isinstance(v, dict) else float(v)
+                      for v in self.ci_mean.values()) / len(self.ci_mean)
+            for z in self.m.zones.values():
+                self.ci_mean.setdefault(z["electricity_area"], {"forecast_mean": avg, "history_mean": avg, "history_count": 0})
+
+    # ----------------------------------------------------------- clock start
+    def _start_clock(self):
+        """The first accepted VM starts the clock.  Use a tiny unbound VM and
+        delete it right away, so real workloads can wait for a clean hour."""
+        if self.starter:
+            return
+        p = min((p for p in self.m.profiles.values() if p["gpu_count"] == 0),
+                key=lambda p: float(p["active_watts"]))
+        zone = min((z for z in p["zones"] if z not in self.exclude), key=lambda z: float(self.m.zones[z]["pue"]))
+        vid = self.env.create(zone, p, None, "orch-starter")
+        self.starter = {"id": vid, "zone": zone, "pid": p["id"], "run": True}
+        self._save()
+        self.log(f"clock starter VM {vid} in {zone}")
+
+    # ----------------------------------------------------------------- tick
+    def tick(self) -> str:
+        st = self.env.status()
+        if st is None:
+            return "wait"
+        if self.memory:
+            self.memory.record_status(st)
+        if st["qualification"] == "DISQUALIFIED":
+            raise RuntimeError("run is disqualified - stopping")
+        if st["state"] in END_STATES:
+            n = sum(1 for w in st["workloads"] if w["final_output_delivered"])
+            self.log(f"run is {st['state']} at {st['virtual_time']} with {n} of {len(st['workloads'])} "
+                     "workloads delivered - nothing left to control. Create a fresh run for a new attempt.")
+            self.cleanup_all()
+            return "ended"
+        if st["state"] == "READY":
+            self._start_clock()
+            return "wait"
+        if st["state"] == "PAUSED":
+            return "wait"
+        now = parse_ts(st["virtual_time"])
+        self._virtual_now = now
+        if self.starter:
+            self.env.delete(self.starter["zone"], self.starter["id"])
+            self.starter = None
+            self._save()
+        sw = {w["id"]: w for w in st["workloads"]}
+        assign = {a["vm_id"]: a["state"] for w in st["workloads"] for a in w.get("assignments", [])}
+        for wid, s in sw.items():
+            if s["final_output_delivered"] and (wid not in self.done or self.vms.get(wid)):
+                self._delete_workload(wid)
+                self.done.add(wid)
+        self._refresh_grid(now)
+        todo = [wid for wid in self.m.workloads if wid not in self.done and wid in sw]
+        plans = {wid: self._assess(self.m.workloads[wid], sw[wid], now) for wid in todo}
+        self.pressure = self._pressure(todo, plans, now)
+        self._todo, self._plans = todo, plans
+        self._score_margins = self._compute_score_margins(todo, plans, now)
+        for wid in sorted(todo, key=lambda i: plans[i]["laxity"]):
+            self._act(self.m.workloads[wid], sw[wid], plans[wid], now, assign)
+        return "done" if len(self.done) == len(self.m.workloads) else "wait"
+
+    def _compute_score_margins(self, todo, plans, now):
+        """Adapt run margins to score-v2 marginal value, using only current-run data.
+
+        The v2 per-workload component has marginal value proportional to
+        (reference_g / (reference_g + projected_g))**2. A positive beta gives
+        cleaner forecast hours to workloads where a gram is worth more points.
+        Beta zero is exactly the legacy policy; inputs are public rules, current
+        workload status, and currently published forecasts only.
+        """
+        refs = getattr(self.m, "reference_energy_kwh", {})
+        if self.score_aware_beta == 0.0 or not refs:
+            return {}
+        values = {}
+        for wid in todo:
+            ref_g = (float(refs.get(wid, 0.0))
+                     * float(getattr(self.m, "reference_gco2e_per_kwh", 200.0)))
+            if ref_g <= 0:
+                continue
+            option = plans[wid].get("plan")
+            if option is None:
+                options = rank_options(
+                    self.m, self.m.workloads[wid], now, plans[wid].get("completed", 0.0),
+                    self.ci_mean, self.exclude
+                )
+                option = pick(options)
+            if option is None:
+                continue
+            projected_g = max(0.0, float(option.electricity_g))
+            values[wid] = (ref_g / (ref_g + projected_g)) ** 2
+        if not values:
+            return {}
+        mean_value = sum(values.values()) / len(values)
+        margins = {}
+        for wid, value in values.items():
+            base = (GPU_MARGIN if self.m.workloads[wid]["kind"] == "gpu"
+                    and GPU_MARGIN is not None else self.margin)
+            factor = (mean_value / value) ** self.score_aware_beta
+            margins[wid] = max(0.75, min(1.35, base * factor))
+        return margins
+
+    # ------------------------------------------------------------ assessment
+    def _assess(self, w, s, now):
+        completed, required = float(s["completed_work"]), float(w["required_work"])
+        vms = self.vms.get(w["id"], [])
+        to_dl = (parse_ts(w["deadline_at"]) - now).total_seconds() / HOUR
+        out_h = w["output_seconds"] / HOUR
+        staged = completed > 0      # same view before and after a restart, so a parked job does not flap
+        plan = None
+        if vms:
+            p = self.m.profiles[vms[0]["pid"]]
+            rate = eff_rate(p, len(vms), float(w["sync_overhead"]))
+            zone = vms[0]["zone"]
+        else:
+            opts = rank_options(self.m, w, now, completed, self.ci_mean, self.exclude)
+            plan = pick(opts)
+            if plan is None:
+                return {"laxity": -1e9, "plan": None, "completed": completed}
+            p = self.m.profiles[plan.pid]
+            rate, zone = rate_per_hour(p), plan.zone
+        rem_h = (required - completed) / rate
+        if not staged:
+            rem_h += (w["input_seconds"] + float(p["boot_seconds"])) / HOUR
+        return {"laxity": to_dl - out_h - rem_h, "plan": plan, "p": p, "zone": zone,
+                "rem_h": rem_h, "to_dl": to_dl, "out_h": out_h, "completed": completed}
+
+    def _pressure(self, todo, plans, now) -> bool:
+        """True while the VMs we hold plus the VMs the still-unadmitted workloads
+        need would exceed the quotas.  Stopped VMs keep their quota, so pausing
+        under pressure delays the workloads waiting for capacity.  Also sets
+        `crunch` when the waiting jobs that are short of slack alone do not fit."""
+        u, urgent = self.usage(), self.usage()
+        for wid in todo:
+            a = plans[wid]
+            rel = parse_ts(self.m.workloads[wid]["release_at"])
+            if self.vms.get(wid) or a["plan"] is None or (rel - now).total_seconds() >= PRESSURE_H * HOUR:
+                continue
+            if not (self.park and a["completed"] > 0 and a["laxity"] > PARK_LAX_H):
+                u.add(a["p"])                   # (a parked job waits on purpose for its clean hours)
+            crunch_h = CRUNCH_H_GPU if (CRUNCH_H_GPU is not None and self.m.workloads[wid]["kind"] == "gpu") else CRUNCH_H
+            if a["laxity"] < crunch_h:
+                urgent.add(a["p"])
+        self.crunch = over_quota(self.m, urgent)
+        return over_quota(self.m, u)
+
+    # ---------------------------------------------------------------- action
+    def _act(self, w, s, a, now, assign):
+        wid = w["id"]
+        completed, required = a.get("completed", 0.0), float(w["required_work"])
+        vms = self.vms.get(wid, [])
+        if completed >= required - 1e-6:        # output phase: never pause
+            self._power(wid, True, now, assign, force=True)
+            return
+        if a["plan"] is None and not vms:
+            self.log(f"{wid}: no legal option")
+            return
+        if not vms and now < parse_ts(w["release_at"]):
+            return
+        series = self.series.get(self.m.zones[a["zone"]]["electricity_area"], []) if self.carbon_aware else []
+        margin = self._score_margins.get(
+            wid, GPU_MARGIN if w["kind"] == "gpu" and GPU_MARGIN is not None else self.margin
+        )
+        run, forced = decide_run(a["rem_h"], a["to_dl"], a["out_h"], series, margin)
+        parked = not vms and a["completed"] > 0 and self._portable(w, a)
+        if self.pressure and not run and not parked:   # a parked job waits for its own clean hours
+            run = not (vms and not self.crunch and self._pause_value(a, series, margin) > PAUSE_VALUE)
+        if not vms:
+            if run:
+                self._create(w, now)
+            return
+        if forced:
+            self._scale_out(w, a, now)
+        else:
+            prev = vms[0]["run"]
+            if run != prev and (now - self.last_change.get(wid, now - timedelta(days=9))).total_seconds() < DWELL_H * HOUR:
+                run = prev
+            since = (now - self.last_change.get(wid, now - timedelta(days=9))).total_seconds() / HOUR
+            if (not run and self._portable(w, a) and all(assign.get(v["id"]) != "creating" for v in vms)
+                    and since >= PARK_COOLDOWN_H
+                    and dirty_run_h(a["rem_h"], a["to_dl"], a["out_h"], series, margin) >= PARK_MIN_H):
+                self._park(wid, now, assign)
+                return
+        self._power(wid, run, now, assign, force=forced)
+
+    def _pause_value(self, a, series, margin=None) -> float:
+        """Carbon a pause saves per hour and per vCPU of quota the paused VM keeps blocked
+        (g/h/vCPU): intensity above the job's own run threshold x active watts x PUE / vCPUs.
+        Energy-dense GPU VMs in a dirty hour score high, CPU VMs in a flat grid score ~0."""
+        if not series:
+            return 0.0
+        ex = excess(a["rem_h"], a["to_dl"], a["out_h"], series,
+                    self.margin if margin is None else margin)
+        p, pue = a["p"], float(self.m.zones[a["zone"]]["pue"])
+        return series[0] * ex / (1.0 + ex) * float(p["active_watts"]) * pue / p["cpu_cores"] / 1000.0
+
+    def _portable(self, w, a) -> bool:
+        """Cheap to restart: frequent checkpoints, short input staging, progress survives
+        deletion.  Such a job is deleted ("parked") instead of stopped during long dirty
+        stretches, so it holds no quota while it waits and can restart in the then-cleanest zone."""
+        return (self.park and self.carbon_aware and w["kind"] == "cpu" and not w["restart_from_zero"]
+                and 0 < int(w["checkpoint_seconds"]) <= PARK_CKPT_S and int(w["input_seconds"]) <= PARK_INPUT_S
+                and a["laxity"] > PARK_LAX_H)
+
+    def _park(self, wid, now, assign):
+        if self._delete_workload(wid, why="parked"):
+            if self.memory:
+                self.memory.event(now, "park", wid)
+            self.log(f"{wid}: parked at {now:%d %H:%M} virtual")
+        else:
+            self._power(wid, False, now, assign)          # could not delete: at least stop it
+        self.last_change[wid] = now
+
+    def _create(self, w, now):
+        wid = w["id"]
+        usage = self._with_reservations(wid, now)
+        opts = rank_options(self.m, w, now, self._plans[wid]["completed"], self.ci_mean, self.exclude)
+        o = pick(opts, self.m, usage)
+        if opts and min(x.ratio for x in opts) > RESCUE_RATIO:
+            # Late admission: never commit to an undersized worker because it is all
+            # that fits; admit a complete deadline-feasible worker group instead.
+            self._create_group(w, now, usage)
+            return
+        if o is None:
+            return                              # wait for quota
+        if w["kind"] == "gpu":
+            # Long GPU work benefits from a short enough worker profile to use
+            # clean forecast windows. Do not consume quota with a one-card plan
+            # whose runtime exceeds 40% of its deadline window when a clean-window
+            # profile exists but is temporarily blocked by other allocations.
+            short = [candidate for candidate in opts if candidate.ratio <= 0.40]
+            target = pick(short) if short else None
+            if target and o.ratio > 0.40:
+                target_profile = self.m.profiles[target.pid]
+                if not usage.fits(self.m, target_profile):
+                    return  # hold for the efficient GPU plan; deadline slack remains reserved
+                o = target
+        if self._plans[wid]["completed"] > 0 and self._portable(w, self._plans[wid]):
+            # a parked job has slack: wait for room for its efficient VM instead of a worse fallback
+            best = pick(opts)
+            if best and o.cost > best.cost * 1.03:
+                return
+        self._spawn(w, o.zone, o.pid)
+        self.last_change[wid] = now
+
+    def _create_group(self, w, now, usage):
+        """Late admission: account for staging, sync and all workers' quotas."""
+        remaining = max(0.0, float(w["required_work"]) - self._plans[w["id"]]["completed"])
+        window_h = (parse_ts(w["deadline_at"]) - now).total_seconds() / HOUR
+        if window_h <= 0:
+            return
+        # Emergency admission still reserves at least one virtual hour for API
+        # and polling delay; do not reject a viable rescue solely for lacking
+        # the ordinary 10% placement headroom.
+        safe_ratio = 1.0 - max(1.0, 0.04 * window_h) / window_h
+        choices = []
+        for n in range(1, int(w["max_workers"]) + 1):
+            per_worker = dict(w, required_work=remaining * (1.0 + float(w["sync_overhead"]) * (n - 1)) / n)
+            for o in rank_options(self.m, per_worker, now, 0.0, self.ci_mean, self.exclude):
+                if o.ratio <= safe_ratio and usage.fits(self.m, self.m.profiles[o.pid], n):
+                    choices.append((o.cost * n, n, o))
+        if not choices:
+            return
+        _, n, o = min(choices, key=lambda x: (x[0], x[1], x[2].ratio))
+        for _ in range(n):
+            self._spawn(w, o.zone, o.pid)
+        self.last_change[w["id"]] = now
+
+    def _with_reservations(self, wid, now) -> Usage:
+        """Current usage plus room kept free for workloads that must not be blocked:
+        more urgent ones, and single-worker jobs that cannot scale out and have a tight window."""
+        usage = self.usage()
+        mine = self._plans[wid]["laxity"]
+        for other in self._todo:
+            a = self._plans[other]
+            wo = self.m.workloads[other]
+            if other == wid or self.vms.get(other) or a["plan"] is None:
+                continue
+            if (parse_ts(wo["release_at"]) - now).total_seconds() >= RESERVE_H * HOUR:
+                continue
+            opts = rank_options(self.m, wo, now, a["completed"], self.ci_mean, self.exclude)
+            tight = int(wo["max_workers"]) == 1 and min(o.ratio for o in opts) > 0.4
+            # A requester that is itself short of slack only yields to jobs that are
+            # even more urgent. Otherwise mutual "tight" reservations can add up to more
+            # than the quota and block every waiting job until its deadline is lost.
+            if mine < URGENT_H:
+                tight = False
+            if a["laxity"] < mine or tight:
+                # Reserve a clean-hour-capable GPU profile for released/near-release
+                # GPU work. A tiny profile can fit quota but force 35-46h of dirty
+                # runtime; medium profiles for w-07/w-09 materially improve timing
+                # flexibility and are often energy-neutral per unit of work.
+                if wo["kind"] == "gpu":
+                    clean_window = [o for o in opts if o.ratio <= 0.40]
+                    o = min(clean_window, key=lambda x: (x.cost, x.footprint)) if clean_window else min_footprint(opts)
+                else:
+                    o = min_footprint(opts)
+                if o:
+                    usage.add(self.m.profiles[o.pid])
+        return usage
+
+    def _spawn(self, w, zone, pid):
+        self.m.assert_legal(w, zone, pid)       # hard stop before any API call
+        n = self.gen.get(w["id"], 0)
+        self.gen[w["id"]] = n + 1
+        name = f"orch-{w['id']}-{n}-p{pid[-2:]}"
+        p = self.m.profiles[pid]
+        vid = self.env.create(zone, p, w["id"], name)
+        self.vms.setdefault(w["id"], []).append({"id": vid, "zone": zone, "pid": pid, "name": name, "run": True})
+        self._save()
+        if self.memory:
+            self.memory.event(self._virtual_now or datetime.now(timezone.utc), "create", w["id"], zone=zone, profile=pid, name=name)
+        self.log(f"{w['id']}: +VM {name} in {zone}")
+
+    def _scale_out(self, w, a, now):
+        wid, vms = w["id"], self.vms[w["id"]]
+        if len(vms) >= int(w["max_workers"]):
+            return
+        remaining = float(w["required_work"]) - a["completed"]
+        avail = a["to_dl"] - a["out_h"] - 1.0 - (w["input_seconds"] + 120) / HOUR
+        want = workers_needed(remaining, avail, a["p"], w)
+        usage = self._with_reservations(wid, now)
+        while len(self.vms[wid]) < want and usage.fits(self.m, a["p"]):
+            self._spawn(w, vms[0]["zone"], vms[0]["pid"])
+            usage.add(a["p"])
+
+    def _power(self, wid, run, now, assign, force=False):
+        changed = False
+        for v in self.vms.get(wid, []):
+            actual = assign.get(v["id"], "running" if v["run"] else "stopped")
+            if actual == "creating":
+                continue
+            if run and actual == "stopped":
+                self.env.set_power(v["zone"], v["id"], True)
+                changed = True
+            elif not run and actual == "running":
+                self.env.set_power(v["zone"], v["id"], False)
+                changed = True
+            v["run"] = run
+        if changed:
+            self.last_change[wid] = now
+            if self.memory:
+                self.memory.event(now, "resume" if run else "pause", wid)
+            self._save()
+            self.log(f"{wid}: {'resume' if run else 'pause'} at {now:%d %H:%M} virtual")
+
+    # --------------------------------------------------------------- cleanup
+    def _delete_workload(self, wid, why="") -> bool:
+        """Delete all VMs of a workload; VMs whose delete failed stay tracked (and are
+        retried next tick) so they keep counting against quota and never run unnoticed."""
+        left = []
+        for v in self.vms.pop(wid, []):
+            try:
+                self.env.delete(v["zone"], v["id"])
+                self.log(f"{wid}: deleted {v['name']}" + (f" ({why})" if why else ""))
+            except Exception as e:                      # e.g. 409 once the run has finished
+                self.log(f"{wid}: delete of {v['name']} failed: {e!r}")
+                left.append(v)
+        if left:
+            self.vms[wid] = left
+        self._save()
+        return not left
+
+    def cleanup_all(self):
+        for wid in list(self.vms):
+            self._delete_workload(wid)
+        if self.starter:
+            try:
+                self.env.delete(self.starter["zone"], self.starter["id"])
+            except Exception as e:
+                self.log(f"starter delete failed: {e!r}")
+            self.starter = None
+            self._save()
+
+
+def run_loop(ctl: Controller, poll=0.25, log=print):
+    ctl.adopt()
+    errors = 0
+    while True:
+        try:
+            r = ctl.tick()
+            if r == "done":
+                log("all workloads delivered and VMs deleted")
+                return
+            if r == "ended":
+                return
+            errors = 0
+        except Illegal:
+            raise
+        except Exception as e:                  # transient API/network problems
+            errors += 1
+            log(f"tick failed ({errors}): {e!r}")
+            if errors > 30:
+                raise
+        time.sleep(poll)

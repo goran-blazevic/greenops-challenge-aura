@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.local/
+.env
+.env.*
+!.env.example
+greenops-exo*.json
+credentials*.json
+*.tfstate*
+.terraform/
+*.tfvars
+*.tfplan
+greenops*.env
+run*.log

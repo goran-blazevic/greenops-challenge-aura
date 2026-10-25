@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/runtime-profile.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "family": {
+      "type": "string",
+      "minLength": 1
+    },
+    "size": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gpu_model": {
+      "type": "string",
+      "minLength": 1
+    },
+    "gpu_memory_gib": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "specification_provenance": {
+      "type": "string",
+      "minLength": 1
+    },
+    "cpu_cores": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "gpu_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "memory_gib": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "active_watts": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/positive_decimal"
+    },
+    "idle_watts": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/decimal"
+    },
+    "stopped_watts": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/decimal"
+    },
+    "throughput": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/positive_decimal"
+    },
+    "work_unit": {
+      "enum": [
+        "vcpu_hour",
+        "tflop"
+      ]
+    },
+    "boot_seconds": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "zones": {
+      "type": "array",
+      "items": {
+        "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/zone"
+      },
+      "minItems": 1,
+      "uniqueItems": true
+    },
+    "lifecycle_kg_per_hour": {
+      "type": "string",
+      "pattern": "^[0-9]+(?:\\.[0-9]+)?$"
+    },
+    "lifecycle_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "power_provenance": {
+      "type": "string",
+      "minLength": 1
+    },
+    "power_basis": {
+      "const": "it_before_pue"
+    }
+  },
+  "required": [
+    "id",
+    "family",
+    "size",
+    "cpu_cores",
+    "gpu_count",
+    "memory_gib",
+    "active_watts",
+    "idle_watts",
+    "stopped_watts",
+    "throughput",
+    "work_unit",
+    "boot_seconds",
+    "zones"
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "gpu_count": {
+            "minimum": 1
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "gpu_model",
+          "gpu_memory_gib"
+        ],
+        "properties": {
+          "work_unit": {
+            "const": "tflop"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "work_unit": {
+            "const": "vcpu_hour"
+          }
+        },
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "gpu_model"
+              ]
+            },
+            {
+              "required": [
+                "gpu_memory_gib"
+              ]
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

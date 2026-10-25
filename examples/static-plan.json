@@ -1,0 +1,19 @@
+{
+  "scenario_id": "pack-40218962a6",
+  "placements": [
+    {
+      "name": "baseline-cpu",
+      "workload_id": "w-01-dach-research",
+      "zone": "at-vie-1",
+      "family": "cpu",
+      "size": "huge"
+    },
+    {
+      "name": "baseline-gpu",
+      "workload_id": "w-08-ch-imaging",
+      "zone": "ch-gva-2",
+      "family": "gpua30",
+      "size": "small"
+    }
+  ]
+}

@@ -1,0 +1,3 @@
+config_path = "/workspace/greenops-exo.json"
+# Outside the container: point python to the starter's .venv/bin/python.
+# python = "/absolute/path/to/participant-starter/.venv/bin/python"

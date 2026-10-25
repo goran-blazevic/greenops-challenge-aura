@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/grid-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "zone": {
+      "enum": [
+        "AT",
+        "BG",
+        "CH",
+        "DE",
+        "HR",
+        "ES",
+        "IT",
+        "FR"
+      ]
+    },
+    "updatedAt": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "temporalGranularity": {
+      "const": "hourly"
+    },
+    "flowTraced": {
+      "const": false
+    },
+    "provenance": {
+      "const": "fictional"
+    },
+    "accountingBasis": {
+      "const": "synthetic_approximate_consumption_mix"
+    },
+    "emissionFactorType": {
+      "const": "lifecycle"
+    },
+    "datetime": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "carbonIntensity": {
+      "type": "number",
+      "minimum": 0
+    },
+    "forecast": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "carbonIntensity": {
+            "type": "number",
+            "minimum": 0
+          },
+          "zone": {
+            "enum": [
+              "AT",
+              "BG",
+              "CH",
+              "DE",
+              "HR",
+              "ES",
+              "IT",
+              "FR"
+            ]
+          },
+          "updatedAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "temporalGranularity": {
+            "const": "hourly"
+          },
+          "flowTraced": {
+            "const": false
+          },
+          "emissionFactorType": {
+            "const": "lifecycle"
+          },
+          "createdAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "isEstimated": {
+            "type": "boolean"
+          },
+          "estimationMethod": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "datetime",
+          "carbonIntensity"
+        ]
+      }
+    },
+    "history": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 25,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "carbonIntensity": {
+            "type": "number",
+            "minimum": 0
+          },
+          "zone": {
+            "enum": [
+              "AT",
+              "BG",
+              "CH",
+              "DE",
+              "HR",
+              "ES",
+              "IT",
+              "FR"
+            ]
+          },
+          "updatedAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "temporalGranularity": {
+            "const": "hourly"
+          },
+          "flowTraced": {
+            "const": false
+          },
+          "emissionFactorType": {
+            "const": "lifecycle"
+          },
+          "createdAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "isEstimated": {
+            "type": "boolean"
+          },
+          "estimationMethod": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "datetime",
+          "carbonIntensity"
+        ]
+      }
+    },
+    "data": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 168,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "carbonIntensity": {
+            "type": "number",
+            "minimum": 0
+          },
+          "zone": {
+            "enum": [
+              "AT",
+              "BG",
+              "CH",
+              "DE",
+              "HR",
+              "ES",
+              "IT",
+              "FR"
+            ]
+          },
+          "updatedAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "temporalGranularity": {
+            "const": "hourly"
+          },
+          "flowTraced": {
+            "const": false
+          },
+          "emissionFactorType": {
+            "const": "lifecycle"
+          },
+          "createdAt": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "isEstimated": {
+            "type": "boolean"
+          },
+          "estimationMethod": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "datetime",
+          "carbonIntensity"
+        ]
+      }
+    },
+    "createdAt": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "isEstimated": {
+      "type": "boolean"
+    },
+    "estimationMethod": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "zone",
+    "updatedAt",
+    "temporalGranularity",
+    "flowTraced",
+    "provenance",
+    "accountingBasis",
+    "emissionFactorType"
+  ],
+  "oneOf": [
+    {
+      "required": [
+        "forecast"
+      ]
+    },
+    {
+      "required": [
+        "history"
+      ]
+    },
+    {
+      "required": [
+        "data"
+      ]
+    },
+    {
+      "required": [
+        "datetime",
+        "carbonIntensity"
+      ]
+    }
+  ]
+}

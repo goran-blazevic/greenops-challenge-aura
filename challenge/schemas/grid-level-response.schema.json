@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/grid-level-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "zone": {
+      "enum": [
+        "AT",
+        "BG",
+        "CH",
+        "DE",
+        "HR",
+        "ES",
+        "IT",
+        "FR"
+      ]
+    },
+    "provenance": {
+      "const": "fictional"
+    },
+    "forecast": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 24,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "level": {
+            "enum": [
+              "low",
+              "moderate",
+              "high"
+            ]
+          }
+        },
+        "required": [
+          "datetime",
+          "level"
+        ]
+      }
+    },
+    "data": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "datetime": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "level": {
+            "enum": [
+              "low",
+              "moderate",
+              "high"
+            ]
+          }
+        },
+        "required": [
+          "datetime",
+          "level"
+        ]
+      }
+    }
+  },
+  "required": [
+    "zone",
+    "provenance"
+  ],
+  "oneOf": [
+    {
+      "required": [
+        "forecast"
+      ]
+    },
+    {
+      "required": [
+        "data"
+      ]
+    }
+  ]
+}

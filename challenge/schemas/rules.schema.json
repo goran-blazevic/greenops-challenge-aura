@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/rules.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "rules",
+    "cohort",
+    "enabled",
+    "scenario_id"
+  ],
+  "properties": {
+    "rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "version",
+        "hash",
+        "reference_energy_kwh",
+        "base_points",
+        "completion_bonus",
+        "reference_gco2e_per_kwh",
+        "local_weight",
+        "shared_weight"
+      ],
+      "properties": {
+        "version": {
+          "enum": [
+            "greenops-score-v1",
+            "greenops-score-v2"
+          ]
+        },
+        "hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "reference_energy_kwh": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "w-01-dach-research",
+            "w-02-ch-reporting",
+            "w-03-med-analysis",
+            "w-04-dach-batch",
+            "w-05-eu-render",
+            "w-06-large-etl",
+            "w-07-eu-training",
+            "w-08-ch-imaging",
+            "w-09-eu-large-model",
+            "w-10-eu-visual",
+            "w-11-dach-simulation",
+            "w-12-late-delivery",
+            "w-13-regional-index",
+            "w-14-bulk-render",
+            "w-15-heavy-archive"
+          ],
+          "properties": {
+            "w-01-dach-research": {
+              "const": "26.400"
+            },
+            "w-02-ch-reporting": {
+              "const": "25.344"
+            },
+            "w-03-med-analysis": {
+              "const": "27.456"
+            },
+            "w-04-dach-batch": {
+              "const": "26.928"
+            },
+            "w-05-eu-render": {
+              "const": "23.232"
+            },
+            "w-06-large-etl": {
+              "const": "24.816"
+            },
+            "w-07-eu-training": {
+              "const": "21.120"
+            },
+            "w-08-ch-imaging": {
+              "const": "9.240"
+            },
+            "w-09-eu-large-model": {
+              "const": "28.380"
+            },
+            "w-10-eu-visual": {
+              "const": "10.488"
+            },
+            "w-11-dach-simulation": {
+              "const": "24.816"
+            },
+            "w-12-late-delivery": {
+              "const": "20.064"
+            },
+            "w-13-regional-index": {
+              "const": "24.288"
+            },
+            "w-14-bulk-render": {
+              "const": "24.816"
+            },
+            "w-15-heavy-archive": {
+              "const": "24.288"
+            }
+          }
+        },
+        "base_points": {
+          "const": 20000
+        },
+        "completion_bonus": {
+          "const": 5000
+        },
+        "reference_gco2e_per_kwh": {
+          "const": 200
+        },
+        "local_weight": {
+          "const": "3/4"
+        },
+        "shared_weight": {
+          "const": "1/4"
+        },
+        "impact_basis": {
+          "const": "electricity_usage"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "version": {
+                "const": "greenops-score-v2"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "impact_basis"
+            ]
+          },
+          "else": {
+            "properties": {
+              "impact_basis": false,
+              "scored_gco2e": false
+            }
+          }
+        }
+      ]
+    },
+    "cohort": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "scenario_id": {
+      "type": "string"
+    }
+  }
+}

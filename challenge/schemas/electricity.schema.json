@@ -1,0 +1,324 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greenops.invalid/specs/electricity.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "observation_delay_seconds": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 86400
+    },
+    "pre_roll_start_at": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "pre_roll_actuals": {
+      "$ref": "#/$defs/areaValues"
+    },
+    "vintages": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 744,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "issued_at": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "available_at": {
+            "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+          },
+          "areas": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/areaValues"
+              },
+              {
+                "additionalProperties": {
+                  "oneOf": [
+                    {
+                      "minItems": 24,
+                      "maxItems": 24
+                    },
+                    {
+                      "minItems": 72,
+                      "maxItems": 72
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          "mix_areas": {
+            "type": "object",
+            "minProperties": 1,
+            "propertyNames": {
+              "enum": [
+                "AT",
+                "BG",
+                "CH",
+                "DE",
+                "HR",
+                "ES",
+                "IT",
+                "FR"
+              ]
+            },
+            "additionalProperties": {
+              "type": "array",
+              "minItems": 24,
+              "items": {
+                "$ref": "#/$defs/mix"
+              },
+              "maxItems": 24
+            }
+          }
+        },
+        "required": [
+          "issued_at",
+          "available_at",
+          "areas"
+        ]
+      }
+    },
+    "mix_start_at": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "mix_actuals": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": [
+          "AT",
+          "BG",
+          "CH",
+          "DE",
+          "HR",
+          "ES",
+          "IT",
+          "FR"
+        ]
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 24,
+        "items": {
+          "$ref": "#/$defs/mix"
+        }
+      }
+    },
+    "renewable_history_start_at": {
+      "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/utc"
+    },
+    "renewable_history": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": [
+          "AT",
+          "BG",
+          "CH",
+          "DE",
+          "HR",
+          "ES",
+          "IT",
+          "FR"
+        ]
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 24,
+        "items": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      }
+    }
+  },
+  "required": [
+    "observation_delay_seconds",
+    "pre_roll_start_at",
+    "pre_roll_actuals",
+    "vintages"
+  ],
+  "$defs": {
+    "areaValues": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": [
+          "AT",
+          "BG",
+          "CH",
+          "DE",
+          "HR",
+          "ES",
+          "IT",
+          "FR",
+          "FR"
+        ]
+      },
+      "additionalProperties": {
+        "type": "array",
+        "minItems": 24,
+        "maxItems": 744,
+        "items": {
+          "$ref": "https://greenops.invalid/specs/common.schema.json#/$defs/decimal"
+        }
+      }
+    },
+    "mix": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "nuclear": {
+          "type": "number",
+          "minimum": 0
+        },
+        "geothermal": {
+          "type": "number",
+          "minimum": 0
+        },
+        "biomass": {
+          "type": "number",
+          "minimum": 0
+        },
+        "coal": {
+          "type": "number",
+          "minimum": 0
+        },
+        "wind": {
+          "type": "number",
+          "minimum": 0
+        },
+        "solar": {
+          "type": "number",
+          "minimum": 0
+        },
+        "hydro": {
+          "type": "number",
+          "minimum": 0
+        },
+        "gas": {
+          "type": "number",
+          "minimum": 0
+        },
+        "oil": {
+          "type": "number",
+          "minimum": 0
+        },
+        "unknown": {
+          "type": "number",
+          "minimum": 0
+        },
+        "hydro storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "charge": {
+              "type": "number",
+              "minimum": 0
+            },
+            "discharge": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "charge",
+            "discharge"
+          ]
+        },
+        "battery storage": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "charge": {
+              "type": "number",
+              "minimum": 0
+            },
+            "discharge": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "charge",
+            "discharge"
+          ]
+        },
+        "flows": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "imports": {
+              "type": "number",
+              "minimum": 0
+            },
+            "exports": {
+              "type": "number",
+              "minimum": 0
+            }
+          },
+          "required": [
+            "imports",
+            "exports"
+          ]
+        }
+      },
+      "required": [
+        "nuclear",
+        "geothermal",
+        "biomass",
+        "coal",
+        "wind",
+        "solar",
+        "hydro",
+        "gas",
+        "oil",
+        "unknown",
+        "hydro storage",
+        "battery storage",
+        "flows"
+      ],
+      "description": "Fictional illustrative power by source in MW; not measured output or a calibrated emissions model."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "anyOf": [
+          {
+            "required": [
+              "mix_actuals"
+            ]
+          },
+          {
+            "required": [
+              "renewable_history"
+            ]
+          }
+        ]
+      },
+      "then": {
+        "required": [
+          "mix_start_at",
+          "mix_actuals",
+          "renewable_history_start_at",
+          "renewable_history"
+        ],
+        "properties": {
+          "vintages": {
+            "items": {
+              "required": [
+                "mix_areas"
+              ]
+            }
+          }
+        }
+      }
+    }
+  ]
+}
